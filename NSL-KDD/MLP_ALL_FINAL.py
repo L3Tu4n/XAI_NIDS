@@ -101,8 +101,8 @@ feature=["duration","protocol_type","service","flag","src_bytes","dst_bytes","la
 # KDDTrain+_2.csv & KDDTest+_2.csv are the datafiles without the last column about the difficulty score
 # these have already been removed.
 
-train='KDDTrain+.txt'
-test='KDDTest+.txt'
+train='/content/XAI_NIDS/NSL-KDD/KDDTrain+.txt'
+test='/content/XAI_NIDS/NSL-KDD/KDDTest+.txt'
 
 df=pd.read_csv(train,names=feature)
 df_test=pd.read_csv(test,names=feature)
