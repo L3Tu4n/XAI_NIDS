@@ -576,99 +576,94 @@ class NIDSModelEvaluator:
         return shap_values, importance_df
     
     def explain_with_lime(self, X_sample, y_sample, n_samples=5):
-        """
-        Explain individual predictions using LIME
-        
-        Args:
-            X_sample: Sample data
-            y_sample: True labels
-            n_samples: Number of samples to explain
-        """
         print(f"\n{'='*60}")
-        print("LIME EXPLANATION")
+        print("LIME EXPLANATION (FIXED INDEX)")
         print(f"{'='*60}")
         
         X_np = X_sample.values if isinstance(X_sample, pd.DataFrame) else X_sample
         y_np = y_sample.values if isinstance(y_sample, pd.Series) else y_sample
         
-        # Sample data
-        indices = np.random.choice(len(X_np), min(n_samples, len(X_np)), replace=False)
+        # Lấy danh sách class thực tế của model (Ví dụ: [0, 2, 3, 9...])
+        model_classes = self.models[0].classes_
         
-        # Get number of classes from model
-        n_classes = len(self.models[0].classes_)
+        indices = np.random.choice(len(X_np), min(n_samples, len(X_np)), replace=False)
         
         # Create LIME explainer
         explainer = lime_tabular.LimeTabularExplainer(
             X_np,
             feature_names=self.feature_names,
-            class_names=[self.label_names.get(i, f'Class_{i}') for i in range(n_classes)],
+            class_names=[self.label_names.get(i, f'Class_{i}') for i in model_classes], # Fix tên class
             mode='classification',
             random_state=42
         )
         
-        print(f"[*] Explaining {len(indices)} individual samples...")
-        
-        # Prediction function (ensemble average)
         def predict_fn(X):
             return self._predict_proba_ensemble(X)
         
-        # Explain each sample
         explanations = []
         
         for i, idx in enumerate(indices):
             sample = X_np[idx]
-            true_label = int(y_np[idx])  # Convert to Python int
-            pred_label = int(self._predict_ensemble(sample.reshape(1, -1))[0])  # Convert to Python int
+            true_label_raw = int(y_np[idx])
+            pred_label_raw = int(self._predict_ensemble(sample.reshape(1, -1))[0])
             
+            # [FIX QUAN TRỌNG] Tìm vị trí (Index) của nhãn trong mảng classes
+            # Ví dụ: Label 2 (PortScan) nằm ở vị trí index 1
+            try:
+                pred_label_idx = np.where(model_classes == pred_label_raw)[0][0]
+            except IndexError:
+                continue
+
             print(f"\n[*] Sample {i+1}/{len(indices)}:")
-            print(f"    True label: {self.label_names.get(true_label, true_label)}")
-            print(f"    Predicted:  {self.label_names.get(pred_label, pred_label)}")
+            print(f"    True label: {self.label_names.get(true_label_raw, true_label_raw)}")
+            print(f"    Predicted:  {self.label_names.get(pred_label_raw, pred_label_raw)}")
             
             try:
-                # Generate explanation
+                # Giải thích dựa trên INDEX
                 exp = explainer.explain_instance(
                     sample,
                     predict_fn,
                     num_features=10,
-                    top_labels=min(3, n_classes)  # Don't ask for more labels than we have
+                    top_labels=3 # Lấy top 3 index có xác suất cao nhất
                 )
-                
                 explanations.append(exp)
                 
-                # Check if explanation exists for predicted label
-                if pred_label not in exp.local_exp:
-                    print(f"    [!] WARNING: No explanation for predicted label {pred_label}")
-                    print(f"    Available labels in explanation: {list(exp.local_exp.keys())}")
-                    # Use the first available label
-                    if len(exp.local_exp) > 0:
-                        pred_label = list(exp.local_exp.keys())[0]
-                        print(f"    Using label {pred_label} instead")
-                    else:
-                        print(f"    [!] Skipping visualization for this sample")
-                        continue
+                # Kiểm tra xem Index dự đoán có trong giải thích không
+                if pred_label_idx in exp.local_exp:
+                    target_idx = pred_label_idx
+                else:
+                    # Nếu không có (hiếm), lấy cái đầu tiên
+                    target_idx = list(exp.local_exp.keys())[0]
+                    print(f"    [!] Warning: Using alternative label index {target_idx}")
+
+                # Map từ Index ngược lại tên Label để in ra
+                target_label_raw = model_classes[target_idx]
+                target_name = self.label_names.get(target_label_raw, target_label_raw)
                 
                 # Save visualization
-                fig = exp.as_pyplot_figure(label=pred_label)
+                fig = exp.as_pyplot_figure(label=target_idx)
                 plt.tight_layout()
                 lime_path = self.output_dir / f'lime_sample_{i+1}.png'
                 plt.savefig(lime_path, dpi=150, bbox_inches='tight')
-                print(f"    [✓] Saved LIME plot to {lime_path}")
                 plt.close()
+                print(f"    [✓] Saved LIME plot to {lime_path}")
                 
-                # Print top features
-                print(f"    Top features:")
-                feature_weights = exp.as_list(label=pred_label)[:5]
+                # Print features (Dùng target_idx để lấy trọng số)
+                feature_weights = exp.as_list(label=target_idx)[:5]
+                print(f"    Top features influencing '{target_name}':")
+                
                 for feature, weight in feature_weights:
-                    direction = "→ ATTACK" if weight > 0 else "→ BENIGN"
+                    # Logic mũi tên: Dương = Ủng hộ target_name
+                    if weight > 0:
+                        direction = f"→ Supports {target_name}"
+                    else:
+                        direction = "→ Contradicts"
                     print(f"      {feature:40s}: {weight:+.4f} {direction}")
                     
             except Exception as e:
-                print(f"    [!] ERROR explaining sample: {e}")
-                print(f"    Skipping this sample...")
+                print(f"    [!] Error: {e}")
                 continue
-        
-        print(f"\n[✓] Successfully explained {len(explanations)} samples")
-        
+                
         return explanations
     
     def generate_full_report(self, X_train, y_train, X_test, y_test):
