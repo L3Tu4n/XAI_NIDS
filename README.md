@@ -165,7 +165,7 @@ docker compose logs -f xai_llm_service
 Truy cập Kibana:
 
 ```
-http://localhost:5601
+http://[IP Kibana]:5601
 ```
 
 ---
@@ -200,7 +200,8 @@ Phù hợp cho:
 ## 11. Tác giả
 
 * **L3Tu4n**
-* Project: *Explainable AI-based Network Intrusion Detection System*
+* **NTTGon**
+* Project: *Applying artificial intelligence to enhance automated cyberattack detection and response and integrating Blockchain to ensure log integrity*
 
 ---
 
