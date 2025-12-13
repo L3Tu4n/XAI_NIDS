@@ -107,7 +107,7 @@ Chạy script tạo topic:
 ```
 Khởi động lại docker
 ```bash
-docker compose up -d --build
+docker compose up -d 
 ```
 Kiểm tra trạng thái:
 
