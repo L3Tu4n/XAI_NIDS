@@ -97,29 +97,30 @@ GEMINI_API_KEY=YOUR_GEMINI_API_KEY
 
 Trên máy chạy Zeek, tiến hành cấu hình Filebeat để gửi log Zeek vào Kafka.
 
-5.2.1. Tạo thư mục và file cấu hình Filebeat
+**5.2.1. Tạo thư mục và file cấu hình Filebeat**
+```
 sudo mkdir -p /etc/filebeat-kafka
 sudo nano /etc/filebeat-kafka/filebeat.yml
-
+```
 
 Sao chép nội dung cấu hình từ repository:
-
+```
 Zeek_file/filebeat.yml
-
+```
 
 vào file:
-
+```
 /etc/filebeat-kafka/filebeat.yml
-
-5.2.2. Tạo systemd service cho Filebeat
+```
+**5.2.2. Tạo systemd service cho Filebeat**
 
 Tạo file service:
-
+```
 sudo nano /etc/systemd/system/filebeat-kafka.service
-
+```
 
 Nội dung file:
-
+```
 [Unit]
 Description=Filebeat Kafka for Zeek Logs
 After=network.target
@@ -137,21 +138,23 @@ User=root
 
 [Install]
 WantedBy=multi-user.target
-
-5.2.3. Reload systemd và khởi động service
+```
+**5.2.3. Reload systemd và khởi động service**
+```
 sudo systemctl daemon-reexec
 sudo systemctl daemon-reload
 sudo systemctl enable filebeat-kafka
 sudo systemctl start filebeat-kafka
-
+```
 
 Kiểm tra trạng thái:
-
+```
 sudo systemctl status filebeat-kafka
-
-5.2.4. Kiểm tra log Filebeat
+```
+**5.2.4. Kiểm tra log Filebeat**
+```
 journalctl -u filebeat-kafka -f
-
+```
 
 Nếu cấu hình đúng, Filebeat sẽ gửi log Zeek (conn.log, http.log, dns.log) vào Kafka topic tương ứng.
 ## 6. Khởi động hệ thống
