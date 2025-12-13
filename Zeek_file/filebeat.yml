@@ -1,0 +1,100 @@
+filebeat.inputs:
+  
+  # --- INPUT 1: CONN.LOG (Routes to zeek-conn) ---
+  - type: log
+    enabled: true
+    paths:
+      - /usr/local/zeek/logs/current/conn.log
+    exclude_lines: ['^#']
+    
+    # JSON Parsing
+    json.keys_under_root: true
+    json.add_error_key: true
+    json.overwrite_keys: true
+    json.message_key: message
+    processors:
+      # Gán nhãn loại log CỐ ĐỊNH: conn
+      - add_fields:
+          target: ''
+          fields:
+            log_type: conn
+            source_host: 192.168.63.129
+            
+      # Thêm trường để định tuyến: output_topic
+      - add_fields:
+          target: '@metadata'
+          fields:
+            output_topic: zeek-conn  # Topic mục tiêu
+            
+      - drop_fields:
+          fields: ["log", "input", "agent", "ecs", "host", "@metadata.input_type"]
+          ignore_missing: true
+
+  # --- INPUT 2: HTTP.LOG (Routes to zeek-http) ---
+  - type: log
+    enabled: true
+    paths:
+      - /usr/local/zeek/logs/current/http.log
+    exclude_lines: ['^#']
+    
+    # JSON Parsing
+    json.keys_under_root: true
+    json.add_error_key: true
+    json.overwrite_keys: true
+    json.message_key: message
+    processors:
+      - add_fields:
+          target: ''
+          fields:
+            log_type: http
+            source_host: 192.168.63.129
+            
+      - add_fields:
+          target: '@metadata'
+          fields:
+            output_topic: zeek-http # Topic mục tiêu
+            
+      - drop_fields:
+          fields: ["log", "input", "agent", "ecs", "host", "@metadata.input_type"]
+          ignore_missing: true
+
+  # --- INPUT 3: DNS.LOG (Routes to zeek-dns) ---
+  - type: log
+    enabled: true
+    paths:
+      - /usr/local/zeek/logs/current/dns.log
+    exclude_lines: ['^#']
+    
+    # JSON Parsing
+    json.keys_under_root: true
+    json.add_error_key: true
+    json.overwrite_keys: true
+    json.message_key: message
+    processors:
+      - add_fields:
+          target: ''
+          fields:
+            log_type: dns
+            source_host: 192.168.63.129
+            
+      - add_fields:
+          target: '@metadata'
+          fields:
+            output_topic: zeek-dns # Topic mục tiêu
+            
+      - drop_fields:
+          fields: ["log", "input", "agent", "ecs", "host", "@metadata.input_type"]
+          ignore_missing: true
+
+# ==========================================
+# OUTPUT: Sử dụng Selector để định tuyến tới 3 topics khác nhau
+# ==========================================
+output.kafka:
+  enabled: true
+  hosts: ["192.168.63.150:9094"]
+  compression: snappy
+  codec.json:
+    pretty: false
+    
+  # ⭐ KEY FIX: Selector và Topic Dynamic
+  topic: "%{[@metadata][output_topic]}"
