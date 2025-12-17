@@ -166,7 +166,7 @@ docker compose up -d --build
 ```
 Chạy script tạo topic:
 ```bash
-./scripts/test_pipeline.sh
+./scripts/create_topics.sh
 ```
 Khởi động lại docker
 ```bash
