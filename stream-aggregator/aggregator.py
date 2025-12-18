@@ -562,12 +562,7 @@ class StreamAggregator:
                         'target_ports_tracking': set(),
                         'target_overflow': False,
                         'sample_targets': [],
-                        'flow_candidates': {
-                            'highest_confidence': None,
-                            'median_confidence': [],
-                            'highest_volume': None,
-                            'longest_duration': None
-                        },
+                        'best_candidate': None
                     }
                 
                 group = attack_groups[key]
@@ -627,14 +622,9 @@ class StreamAggregator:
                     'ml_features': clean_features
                 }
                 
-                candidates = group['flow_candidates']
-                if candidates['highest_confidence'] is None or result['confidence'] > candidates['highest_confidence']['confidence']:
-                    candidates['highest_confidence'] = flow_record
-                if len(candidates['median_confidence']) < 100: candidates['median_confidence'].append(flow_record)
-                if candidates['highest_volume'] is None or clean_features['total_bytes'] > candidates['highest_volume']['ml_features']['total_bytes']:
-                    candidates['highest_volume'] = flow_record
-                if candidates['longest_duration'] is None or clean_features['duration'] > candidates['longest_duration']['ml_features']['duration']:
-                    candidates['longest_duration'] = flow_record
+                current_best = group['best_candidate']
+                if current_best is None or result['confidence'] > current_best['confidence']:
+                    group['best_candidate'] = flow_record
             
             # ========================================
             # STEP 5: Flush Aggregated Alerts
@@ -644,27 +634,16 @@ class StreamAggregator:
             
             for group in attack_groups.values():
                 # Select Representatives
-                candidates = group['flow_candidates']
+                best_flow = group['best_candidate']
                 representative_flows = []
                 
-                if candidates['highest_confidence']:
-                    rep = candidates['highest_confidence'].copy()
-                    rep['selection_reason'] = 'highest_confidence'
-                    representative_flows.append(rep)
-                
-                if candidates['median_confidence']:
-                    sorted_flows = sorted(candidates['median_confidence'], key=lambda x: x['confidence'])
-                    rep = sorted_flows[len(sorted_flows)//2].copy()
-                    rep['selection_reason'] = 'median_confidence'
-                    representative_flows.append(rep)
-                
-                if candidates['highest_volume']:
-                    rep = candidates['highest_volume'].copy()
-                    rep['selection_reason'] = 'highest_volume'
-                    representative_flows.append(rep)
+                if best_flow:
+                    # Gán lý do chọn (mặc định là highest_confidence)
+                    best_flow['selection_reason'] = 'highest_confidence'
+                    representative_flows.append(best_flow)
 
                 # Finalize group data
-                del group['flow_candidates']
+                del group['best_candidate'] # Xóa biến tạm
                 group['protocols'] = list(group['protocols'])
                 group['services'] = list(group['services'])
                 group['unique_dst_ip_count'] = len(group['target_ips_tracking'])
