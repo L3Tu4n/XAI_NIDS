@@ -1,0 +1,31 @@
+{
+  "model_type": "Isolation Forest",
+  "purpose": "Zero-day & DNS tunneling detection",
+  "feature_names": [
+    "duration",
+    "orig_bytes",
+    "resp_bytes",
+    "orig_pkts",
+    "resp_pkts",
+    "bytes_per_sec",
+    "pkts_per_sec",
+    "bytes_per_pkt",
+    "byte_ratio",
+    "pkt_ratio",
+    "src_conn_count",
+    "src_unique_dests",
+    "src_unique_ports",
+    "src_service_diversity",
+    "dst_conn_count",
+    "proto_numeric",
+    "service_intensity",
+    "port_usage_ratio",
+    "dns_query_len",
+    "dns_entropy"
+  ],
+  "scaler": "models/if_scaler.joblib",
+  "threshold": -0.06876451253945295,
+  "threshold_percentile": 5,
+  "decision_rule": "score < threshold => anomaly",
+  "notes": "RobustScaler + percentile-based threshold"
+}

@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-ML API Service - HYBRID VERSION (Tri-LGBM + Anomaly Detection)
-Features:
-- Tri-Training Majority Voting
-- Isolation Forest Anomaly Scoring (Zero-day detection)
+ML API Service - HYBRID VERSION (Fixed Boolean Serialization)
+Fixes:
+- Strict Schema Enforcement: Force dtypes before prediction to match training metadata.
+- Fix 'train and valid dataset categorical_feature do not match'.
 """
 from flask import Flask, request, jsonify
 import joblib
 import numpy as np
 import pandas as pd
 import json
-import pickle
 from pathlib import Path
 import logging
 from datetime import datetime
@@ -31,62 +30,62 @@ ml_service = None
 class NIDSMLService:
     """Service class quản lý Model và Inference"""
     
-    def __init__(self, model_path, metadata_path, encoder_path, anomaly_model_path=None):
-        logger.info("📂 Loading resources...")
+    def __init__(self, model_dir):
+        self.model_dir = Path(model_dir)
+        logger.info(f"📂 Loading resources from {self.model_dir}...")
         
-        # --- A. LOAD MAIN MODEL (Tri-LGBM) ---
-        if not Path(model_path).exists():
-            raise FileNotFoundError(f"❌ Main model missing: {model_path}")
-        self.models = joblib.load(model_path)
-        logger.info(f"✅ Loaded Tri-LGBM: {Path(model_path).name} (Count: {len(self.models)})")
+        # 1. LOAD LIGHTGBM
+        lgbm_path = self.model_dir / 'nids_tri_lgbm_v1.joblib'
+        lgbm_meta_path = self.model_dir / 'nids_tri_lgbm_v1_metadata.json'
         
-        # --- B. LOAD ANOMALY MODEL (Isolation Forest) ---
-        self.anomaly_model = None
-        if anomaly_model_path and Path(anomaly_model_path).exists():
-            try:
-                self.anomaly_model = joblib.load(anomaly_model_path)
-                logger.info(f"✅ Loaded Anomaly Detector: {Path(anomaly_model_path).name}")
-            except Exception as e:
-                logger.error(f"❌ Failed to load Anomaly Detector: {e}")
-        else:
-            logger.warning(f"⚠️ No Anomaly Model found at {anomaly_model_path}. Zero-day detection disabled.")
-
-        # --- C. LOAD METADATA ---
-        if not Path(metadata_path).exists():
-            raise FileNotFoundError(f"❌ Metadata missing: {metadata_path}")
-        with open(metadata_path, 'r') as f:
-            self.metadata = json.load(f)
-        
-        # Hỗ trợ key cũ và mới
-        self.feature_names = self.metadata.get('feature_names') or self.metadata.get('feature_columns')
-        if not self.feature_names: raise ValueError("Metadata missing feature list")
+        if not lgbm_path.exists():
+            raise FileNotFoundError(f"❌ LGBM model missing: {lgbm_path}")
             
-        self.num_classes = self.metadata.get('num_classes', 15)
-        logger.info(f"✅ Loaded Metadata. Input Features: {len(self.feature_names)}")
+        self.models = joblib.load(lgbm_path)
         
-        # --- D. LOAD ENCODER ---
-        if not Path(encoder_path).exists():
-             logger.warning(f"⚠️ Encoder file missing at {encoder_path}")
-             self.encoders = {}
-        else:
+        with open(lgbm_meta_path, 'r') as f:
+            self.lgbm_meta = json.load(f)
+            self.lgbm_features = self.lgbm_meta.get('feature_names') or self.lgbm_meta.get('feature_columns')
+            if not self.lgbm_features:
+                raise ValueError("❌ LGBM Metadata missing feature list")
+            
+        logger.info(f"✅ Loaded Tri-LGBM. Features: {len(self.lgbm_features)}")
+        
+        # Xác định cột category từ tên feature (để ép kiểu sau này)
+        self.cat_cols = [col for col in self.lgbm_features if 'encoded' in col or 'numeric' in col]
+        logger.info(f"    Categorical columns to enforce: {self.cat_cols}")
+        
+        # 2. LOAD ISOLATION FOREST
+        if_path = self.model_dir / 'isolation_forest.joblib'
+        if_scaler_path = self.model_dir / 'if_scaler.joblib'
+        if_meta_path = self.model_dir / 'isolation_forest_metadata.json'
+        
+        self.anomaly_model = None
+        self.if_scaler = None
+        
+        if if_path.exists() and if_scaler_path.exists():
             try:
-                with open(encoder_path, 'rb') as f:
-                    self.encoders = pickle.load(f)
-                logger.info(f"✅ Loaded Encoders: {Path(encoder_path).name}")
+                self.anomaly_model = joblib.load(if_path)
+                self.if_scaler = joblib.load(if_scaler_path)
+                
+                with open(if_meta_path, 'r') as f:
+                    self.if_meta = json.load(f)
+                    self.if_features = self.if_meta.get('feature_names') or self.if_meta.get('feature_columns')
+                    self.if_threshold = self.if_meta.get('threshold', -0.05)
+                    
+                logger.info(f"✅ Loaded IF Model & Scaler. Threshold: {self.if_threshold}")
             except Exception as e:
-                logger.error(f"❌ Failed to load encoder: {e}")
-                self.encoders = {}
-        
-        # --- E. MAP CLASSES ---
-        # Lấy class map từ model đầu tiên
+                logger.error(f"❌ Failed to load IF resources: {e}")
+        else:
+            logger.warning(f"⚠️ Isolation Forest files missing")
+
+        # 3. MAP CLASSES
         try:
             self.model_classes = self.models[0].classes_
             self.class_to_idx = {label: idx for idx, label in enumerate(self.model_classes)}
         except AttributeError:
-            logger.warning("Could not detect model classes, using default.")
-            self.class_to_idx = {0: 0, 1: 1} # Fallback
+            self.class_to_idx = {0: 0, 1: 1}
 
-        # Mapping Attack Types (CIC-IDS-2017)
         self.label_to_attack = {
             0: 'BENIGN', 1: 'DoS Hulk', 2: 'PortScan', 3: 'DDoS',
             4: 'DoS GoldenEye', 5: 'FTP-Patator', 6: 'SSH-Patator',
@@ -95,103 +94,120 @@ class NIDSMLService:
             12: 'Web Attack - SQL Injection', 13: 'Infiltration', 14: 'Heartbleed'
         }
 
-    def _prepare_dataframe(self, features_data):
-        if isinstance(features_data, dict):
-            features_data = [features_data]
-        df = pd.DataFrame(features_data)
+    def _prepare_dataframe(self, features_list, required_features):
+        """
+        Prepare DataFrame and FORCE correct dtypes
+        """
+        df = pd.DataFrame(features_list)
         
-        # Fill missing cols
-        for feature in self.feature_names:
+        # 1. Ensure all columns exist
+        for feature in required_features:
             if feature not in df.columns: df[feature] = 0
-        
-        # Select & Clean
-        df = df[self.feature_names]
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+            
+        # 2. Select and Clean
+        df = df[required_features].copy()
+        df.replace([np.inf, -np.inf], 0, inplace=True)
         df.fillna(0, inplace=True)
         
-        # Ensure Numeric
-        for col in df.columns:
-             if df[col].dtype == 'object':
-                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-                 
+        # 3. [FIX] Enforce Categorical Types for LightGBM
+        # Đây là bước quan trọng để khớp với metadata lúc train
+        for col in self.cat_cols:
+            if col in df.columns:
+                try:
+                    # Ép về int trước (tránh lỗi float 1.0 != 1)
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
+                    # Sau đó ép về category
+                    df[col] = df[col].astype('category')
+                except Exception as e:
+                    # Fallback nếu lỗi, log warning nhưng không crash
+                    pass
+
         return df
 
     def predict_batch_optimized(self, features_list):
-        """
-        Dự đoán Batch kết hợp Anomaly Detection
-        """
+        def tri_training_vote(preds):
+            counts = np.bincount(preds.astype(int))
+            if len(counts) == 0: return 0
+            top_class = counts.argmax()
+            if counts[top_class] >= 2: return top_class
+            return preds[0]
+
         try:
             if not features_list: return []
-            X = self._prepare_dataframe(features_list)
             
-            # 1. TRI-TRAINING PREDICTION (Supervised)
-            all_preds = np.array([model.predict(X) for model in self.models])
-            all_probas = np.array([model.predict_proba(X) for model in self.models])
+            # Predict LGBM
+            # Hàm _prepare_dataframe đã được vá lỗi dtypes
+            X_lgbm = self._prepare_dataframe(features_list, self.lgbm_features)
             
-            # 2. ANOMALY DETECTION (Unsupervised)
+            all_preds = np.array([model.predict(X_lgbm) for model in self.models])
+            all_probas = np.array([model.predict_proba(X_lgbm) for model in self.models])
+            
+            # Predict IF
             anomaly_scores = None
             if self.anomaly_model:
-                # decision_function trả về số thực. 
-                # Càng thấp (âm) = Càng bất thường. Càng cao (dương) = Càng bình thường.
-                anomaly_scores = self.anomaly_model.decision_function(X)
+                # IF dùng RobustScaler nên cũng cần ép kiểu số (không cần category)
+                # Nhưng dùng chung _prepare_dataframe vẫn an toàn
+                X_if = self._prepare_dataframe(features_list, self.if_features)
+                
+                # Scaler expect DataFrame with correct names
+                X_if_scaled = self.if_scaler.transform(X_if)
+                anomaly_scores = self.anomaly_model.decision_function(X_if_scaled)
             
             results = []
-            n_samples = X.shape[0]
-            
-            # Ngưỡng Zero-day (Cần tinh chỉnh tùy dataset, ví dụ -0.15)
-            ANOMALY_THRESHOLD = -0.15 
+            n_samples = len(features_list)
             
             for i in range(n_samples):
-                # --- A. Supervised Logic ---
+                # LGBM Result
                 sample_preds = all_preds[:, i] 
-                maj_vote = int(np.bincount(sample_preds.astype(int)).argmax())
+                maj_vote = tri_training_vote(sample_preds)
                 
                 class_idx = self.class_to_idx.get(maj_vote, 0)
                 avg_proba = np.mean(all_probas[:, i, :], axis=0)
+                confidence = float(avg_proba[class_idx]) if class_idx < len(avg_proba) else 0.0
                 
-                try:
-                    confidence = float(avg_proba[class_idx])
-                except IndexError:
-                    confidence = 0.0
-
                 benign_idx = self.class_to_idx.get(0, 0)
-                try:
-                    attack_prob = float(1.0 - avg_proba[benign_idx])
-                except IndexError:
-                    attack_prob = 0.0
+                attack_prob = float(1.0 - avg_proba[benign_idx]) if benign_idx < len(avg_proba) else 0.0
                 
-                is_attack = (maj_vote != 0)
+                # 🛠️ FIX: Ép kiểu bool() rõ ràng
+                is_attack = bool(maj_vote != 0)
                 attack_type = self.label_to_attack.get(maj_vote, f'Class_{maj_vote}')
                 
-                # --- B. Anomaly Logic (Zero-day check) ---
+                # IF Result
                 anomaly_score = 0.0
+                anomaly_distance = 0.0
                 is_anomaly = False
                 
                 if anomaly_scores is not None:
                     anomaly_score = float(anomaly_scores[i])
-                    # Nếu điểm thấp hơn ngưỡng -> Bất thường
-                    if anomaly_score < ANOMALY_THRESHOLD:
+                    if anomaly_score < self.if_threshold:
                         is_anomaly = True
-                
-                # --- C. Hybrid Decision ---
-                # Nếu model chính bảo SẠCH, nhưng model Anomaly bảo RẤT LẠ -> Cảnh báo Zero-day
-                if not is_attack and is_anomaly:
-                    is_attack = True
-                    attack_type = "Potential Zero-Day"
-                    # Gán confidence thấp hơn một chút để biết là phỏng đoán
-                    confidence = 0.75 
-                    attack_prob = 0.75
+                    if self.if_threshold != 0:
+                        anomaly_distance = max(0.0, (self.if_threshold - anomaly_score) / abs(self.if_threshold))
 
+                # Hybrid Decision
+                final_verdict = "Clean"
+                if is_attack:
+                    final_verdict = f"Known Attack: {attack_type}"
+                elif is_anomaly:
+                    is_attack = True
+                    attack_type = "Zero-Day / Unknown Attack"
+                    final_verdict = "Suspicious (Anomaly Detected)"
+                    if attack_prob < 0.5: attack_prob = 0.65
+
+                # 🛠️ FIX: Đảm bảo toàn bộ giá trị là native Python types
                 results.append({
-                    'is_attack': is_attack,
-                    'attack_type': attack_type,
-                    'predicted_class': maj_vote,
+                    'is_attack': bool(is_attack),       # Explicit bool conversion
+                    'attack_type': str(attack_type),
+                    'verdict': str(final_verdict),
+                    'predicted_class': int(maj_vote),   # Explicit int conversion
                     'confidence': round(confidence, 4),
                     'attack_probability': round(attack_prob, 4),
-                    'anomaly_score': round(anomaly_score, 4), # Thêm điểm bất thường vào kết quả
-                    'is_anomaly': is_anomaly,
+                    'anomaly_score': round(anomaly_score, 4),
+                    'anomaly_distance': round(anomaly_distance, 4),
+                    'is_anomaly': bool(is_anomaly),     # Explicit bool conversion
                     'timestamp': datetime.utcnow().isoformat()
                 })
+            
             return results
             
         except Exception as e:
@@ -199,48 +215,29 @@ class NIDSMLService:
             return []
 
 def init_service():
-    """Hàm khởi tạo Service"""
     global ml_service
     try:
-        base_dir = Path('/opt/ml-nids/models')
+        env_model_dir = os.getenv('MODEL_DIR')
+        if env_model_dir:
+            base_dir = Path(env_model_dir).resolve()
+        else:
+            base_dir = Path('./models').resolve()
         
-        # ⚠️ SỬA TÊN FILE CHO KHỚP VỚI LỆNH LS CỦA BẠN
-        # 1. Main Model (Tri-LGBM)
-        model_path = base_dir / 'nids_tri_lgbm_v1_trilgbm.joblib' 
-        
-        # 2. Metadata
-        metadata_path = base_dir / 'nids_tri_lgbm_v1_metadata.json'
-        
-        # 3. Anomaly Model (Isolation Forest)
-        anomaly_path = base_dir / 'nids_tri_lgbm_v1_isolforest.joblib'
-        
-        # 4. Encoder
-        encoder_path = base_dir / 'feature_schema.pkl'
-        
-        logger.info(f"Init Service with: {model_path.name}")
-        
-        ml_service = NIDSMLService(
-            str(model_path), 
-            str(metadata_path), 
-            str(encoder_path),
-            str(anomaly_path)
-        )
+        logger.info(f"Init Service from: {base_dir}")
+        if not base_dir.exists():
+             logger.error(f"❌ Directory not found: {base_dir}")
+             return
+
+        ml_service = NIDSMLService(base_dir)
         logger.info("🚀 ML API Initialized Successfully!")
-        
-    except Exception as e:
-        logger.error(f"❌ FATAL: Initialization failed: {e}")
-        
     except Exception as e:
         logger.error(f"❌ FATAL: Initialization failed: {e}")
 
-# Init ngay khi import
 init_service()
 
-# --- FLASK ROUTES ---
 @app.route('/health', methods=['GET'])
 def health_check():
     global ml_service
-    if ml_service is None: init_service()
     status = 200 if ml_service else 503
     return jsonify({'status': 'healthy' if ml_service else 'error'}), status
 
@@ -248,10 +245,9 @@ def health_check():
 def model_info():
     if not ml_service: return jsonify({'error': 'Not initialized'}), 503
     return jsonify({
-        'feature_names': ml_service.feature_names,
-        'num_models': len(ml_service.models),
-        'has_anomaly_detector': ml_service.anomaly_model is not None,
-        'classes': [int(c) for c in ml_service.model_classes]
+        'lgbm_features': ml_service.lgbm_features,
+        'if_features': ml_service.if_features,
+        'threshold': ml_service.if_threshold
     }), 200
 
 @app.route('/predict_batch', methods=['POST'])
@@ -264,7 +260,6 @@ def predict_batch():
         
         features_list = [item.get('features', {}) for item in data['samples']]
         results = ml_service.predict_batch_optimized(features_list)
-        
         return jsonify({'predictions': results, 'count': len(results)}), 200
         
     except Exception as e:

@@ -3,32 +3,44 @@
     "duration",
     "orig_bytes",
     "resp_bytes",
-    "missed_bytes",
     "orig_pkts",
-    "orig_ip_bytes",
     "resp_pkts",
-    "resp_ip_bytes",
-    "total_bytes",
-    "total_pkts",
     "bytes_per_sec",
     "pkts_per_sec",
     "bytes_per_pkt",
     "byte_ratio",
     "pkt_ratio",
-    "proto_numeric",
-    "proto_str_encoded",
     "service_encoded",
     "conn_state_encoded",
     "src_conn_count",
     "src_unique_dests",
     "src_unique_ports",
     "src_service_diversity",
-    "dst_conn_count"
+    "dst_conn_count",
+    "proto_numeric",
+    "service_intensity",
+    "port_usage_ratio"
   ],
-  "num_features": 24,
-  "model_type": "Hybrid (Tri-LGBM + IsolationForest)",
+  "num_features": 20,
+  "model_type": "Tri-Training LightGBM",
   "num_classifiers": 3,
   "num_classes": 6,
-  "has_anomaly_model": true,
-  "encoder_reference_path": "CIC-IDS-2017/feature_schema.pkl"
+  "error_rates": [
+    [
+      0.0,
+      0.003906474406847771,
+      0.003906698839480693
+    ],
+    [
+      0.003734773615260867,
+      0.0,
+      0.003906025618932718
+    ],
+    [
+      0.003906025618932718,
+      0.0039646058377385,
+      0.0
+    ]
+  ],
+  "encoder_reference_path": "CIC-IDS-2017/feature_schema_lgbm.pkl"
 }

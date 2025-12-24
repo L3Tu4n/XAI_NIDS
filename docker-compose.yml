@@ -88,6 +88,7 @@ services:
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=INFO
       - WORKERS=4
+      - MODEL_DIR=/opt/ml-nids/models
     restart: unless-stopped
     networks:
       - ml-nids-network
@@ -117,11 +118,11 @@ services:
       - ./models:/opt/ml-nids/models:ro
     environment:
       # Kafka configuration
-      - ENCODER_PATH=/opt/ml-nids/models/feature_schema.pkl
+      - ENCODER_PATH=/opt/ml-nids/models/feature_schema_lgbm.pkl
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       
       # Topic names - CORRECTED
-      - INPUT_TOPIC=zeek-conn              # Input từ Filebeat (tên topic chuẩn)
+      - INPUT_TOPIC=zeek-raw             # Input từ Filebeat (tên topic chuẩn)
       - OUTPUT_TOPIC=ml-predictions   
       - XAI_QUEUE_TOPIC=xai-queue     # Output sau aggregate + ML
       - CONSUMER_GROUP=stream-aggregator-group
@@ -211,7 +212,7 @@ services:
       - ES_USERNAME=elastic
       - ES_PASSWORD=-B8Ph8fVTlnMPP-K7ffw
       - LLM_PROVIDER=gemini
-      - GEMINI_API_KEY=AIzaSyCCPbIZKK9hR2xyWnGa1t1xbW0y0ZnzZUE
+      - GEMINI_API_KEY=AIzaSyCPPoZwFiIks2zao0w6sIe5l-JwZTwOdA0
       - XAI_DEDUP_HOURS=1
       - LOG_LEVEL=INFO
     restart: unless-stopped

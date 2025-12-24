@@ -1,0 +1,62 @@
+{
+  "model_type": "if",
+  "feature_columns": [
+    "duration",
+    "orig_bytes",
+    "resp_bytes",
+    "orig_pkts",
+    "resp_pkts",
+    "bytes_per_sec",
+    "pkts_per_sec",
+    "bytes_per_pkt",
+    "byte_ratio",
+    "pkt_ratio",
+    "src_conn_count",
+    "src_unique_dests",
+    "src_unique_ports",
+    "src_service_diversity",
+    "dst_conn_count",
+    "proto_numeric",
+    "service_intensity",
+    "port_usage_ratio",
+    "dns_query_len",
+    "dns_entropy"
+  ],
+  "time_window": "10s",
+  "num_features": 20,
+  "encoder_config": {
+    "handle_unknown": "use_encoded_value",
+    "unknown_value": -1,
+    "dtype": "int32"
+  },
+  "encoders": [
+    "service",
+    "conn_state"
+  ],
+  "core_features": [
+    "duration",
+    "orig_bytes",
+    "resp_bytes",
+    "orig_pkts",
+    "resp_pkts",
+    "bytes_per_sec",
+    "pkts_per_sec",
+    "bytes_per_pkt",
+    "byte_ratio",
+    "pkt_ratio",
+    "src_conn_count",
+    "src_unique_dests",
+    "src_unique_ports",
+    "src_service_diversity",
+    "dst_conn_count",
+    "proto_numeric",
+    "service_intensity",
+    "port_usage_ratio",
+    "dns_query_len",
+    "dns_entropy"
+  ],
+  "dns_features": [
+    "dns_query_len",
+    "dns_entropy"
+  ]
+}

@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
 """
-Stream Aggregator - PRODUCTION READY (FIXED LOGIC ERRORS + DEBUG LOGGING)
-
-Critical fixes:
-1. ✅ Fixed index mapping between flows_df and features_df
-2. ✅ Fixed features extraction for cached flows
-3. ✅ Added proper None/empty result handling
-4. ✅ Fixed representative flow selection logic
-5. ✅ Added thread-safe cache operations
-6. ✅ Enhanced timestamp parsing (handles ms/s + debug logging)
-7. ✅ Added comprehensive flow tracking debug logs
-
-Author: ML-NIDS Team
-Version: 2.1.0
+Stream Aggregator - SMART CACHE INVALIDATION (v7.10)
+Updates:
+- ✅ LOGIC: Detect Attack Switching (e.g., PortScan -> SSH).
+- ✅ FIX: Invalidate old cache & Start fresh session on switch.
+- ✅ FIX: Force Detailed Alert for the switch event.
 """
 import os
 import json
 import logging
 import asyncio
 import signal
+import time
+import math
+import random
 import hashlib
 from datetime import datetime, timedelta
-from collections import defaultdict
 from threading import Lock
+from collections import defaultdict
 
 import pandas as pd
 import numpy as np
@@ -30,7 +25,11 @@ import httpx
 from confluent_kafka import Consumer, Producer, KafkaException
 from dateutil import parser as date_parser
 
-from feature_engineer import StreamFeatureEngineer
+try:
+    from feature_engineer import NIDSFeatureEngineer
+except ImportError:
+    print("❌ Error: Missing 'feature_engineering.py'")
+    exit(1)
 
 # Setup logging
 logging.basicConfig(
@@ -43,823 +42,536 @@ logger = logging.getLogger('stream-aggregator')
 # CONFIGURATION
 # ==========================================
 KAFKA_BOOTSTRAP = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'kafka:9092')
-INPUT_TOPIC = os.getenv('INPUT_TOPIC', 'zeek-conn')
+INPUT_TOPIC = os.getenv('INPUT_TOPIC', 'zeek-raw')
 OUTPUT_TOPIC = os.getenv('OUTPUT_TOPIC', 'ml-predictions')
 XAI_QUEUE_TOPIC = os.getenv('XAI_QUEUE_TOPIC', 'xai-queue')
 CONSUMER_GROUP = os.getenv('CONSUMER_GROUP', 'stream-aggregator-group')
+
 WINDOW_SIZE_SECONDS = int(os.getenv('WINDOW_SIZE_SECONDS', '10'))
-FLUSH_INTERVAL_SECONDS = int(os.getenv('FLUSH_INTERVAL_SECONDS', '5'))
-MAX_BUFFER_SIZE = int(os.getenv('MAX_BUFFER_SIZE', '1000'))
+MAX_BUFFER_SIZE = int(os.getenv('MAX_BUFFER_SIZE', '5000'))
+FLUSH_INTERVAL_SECONDS = 5
+
 ML_API_URL = os.getenv('ML_API_URL', 'http://ml-api:5000')
-ENCODER_PATH = os.getenv('ENCODER_PATH', '/opt/ml-nids/models/feature_schema.pkl')
+ENCODER_PATH = os.getenv('ENCODER_PATH', '/opt/ml-nids/models/feature_schema_lgbm.pkl')
 
-# Cache & Aggregation Settings
-CACHE_TTL_SECONDS = int(os.getenv('CACHE_TTL_SECONDS', '300'))
-CACHE_MIN_CONFIDENCE = float(os.getenv('CACHE_MIN_CONFIDENCE', '0.85'))
-CACHE_UPDATE_CONFIDENCE = float(os.getenv('CACHE_UPDATE_CONFIDENCE', '0.90'))
-MAX_UNIQUE_TRACKING = int(os.getenv('MAX_UNIQUE_TRACKING', '1000'))
-XAI_SEVERITY_THRESHOLD = int(os.getenv('XAI_SEVERITY_THRESHOLD', '0'))
+# Cache & Session Settings
+CACHE_TTL_SECONDS = 300 
+CACHE_MIN_CONFIDENCE = 0.90
+CACHE_REVERIFY_RATE = float(os.getenv('CACHE_REVERIFY_RATE', '0.1'))
+MAX_ACTIVE_SESSIONS = 50000 
+
+DROP_FIELDS = ['agent', 'host', 'ecs', 'error', 'message', 'input', 'log', 'tags', '@version', '@metadata']
 
 # ==========================================
-# UTILITY FUNCTIONS
+# UTILITY
 # ==========================================
-def get_attack_session_id(src_ip, attack_type, time_bucket_hours=1):
-    """Generate deterministic session ID for attack tracking"""
+def get_attack_session_id(src_ip, attack_type):
     now = datetime.utcnow()
-    bucket = now.replace(minute=0, second=0, microsecond=0)
-    session_string = f"{src_ip}:{attack_type}:{bucket.isoformat()}"
-    session_id = hashlib.md5(session_string.encode()).hexdigest()[:16]
-    return session_id
-
-
-def calculate_attack_severity(group):
-    """Calculate attack severity score (0-100)"""
-    volume_score = min(40, (group['flow_count'] / 100) * 40)
-    
-    unique_targets = max(
-        group.get('unique_dst_ip_count', 0),
-        group.get('unique_dst_port_count', 0)
-    )
-    scope_score = min(30, (unique_targets / 10) * 30)
-    confidence_score = group['avg_confidence'] * 20
-    
-    critical_types = {
-        'Infiltration': 10, 'Web Attack - SQL Injection': 9,
-        'Web Attack - XSS': 8, 'Web Attack - Brute Force': 7,
-        'Bot': 7, 'DDoS': 6, 'DoS Hulk': 5, 'PortScan': 4,
-        'SSH-Patator': 6, 'FTP-Patator': 6
-    }
-    type_score = critical_types.get(group['attack_type'], 3)
-    
-    severity = volume_score + scope_score + confidence_score + type_score
-    return min(100, int(severity))
-
-
-def safe_str(value):
-    """Safely convert to string"""
-    return str(value) if pd.notna(value) else '-'
-
-
-def safe_num(value, default=0.0):
-    """Safely convert to number"""
-    return float(value) if pd.notna(value) else default
-
+    time_bucket = now.strftime('%Y-%m-%d-%H')
+    raw_str = f"{src_ip}-{attack_type}-{time_bucket}"
+    return hashlib.md5(raw_str.encode()).hexdigest()
 
 # ==========================================
-# ENHANCED ATTACK CACHE (Thread-safe)
+# 1. SMART ATTACK CACHE
 # ==========================================
 class AttackCache:
-    """Thread-safe cache with enhanced metadata tracking"""
-    
-    def __init__(self, ttl_seconds=CACHE_TTL_SECONDS):
-        self.cache = {}
+    def __init__(self, ttl_seconds=60, max_hits=1000, min_conf=0.90):
+        self.cache = {} 
         self.ttl = ttl_seconds
-        self.lock = Lock()  # ✅ Thread-safe
-        self.stats = {
-            'hits': 0, 'misses': 0,
-            'ml_calls_saved': 0, 'unique_attackers': 0
-        }
+        self.max_hits = max_hits
+        self.min_conf = min_conf
+        self.lock = Lock()
     
     def get(self, src_ip):
-        """Get cached attack detection (thread-safe)"""
         with self.lock:
-            if src_ip not in self.cache:
-                self.stats['misses'] += 1
-                return None
-            
-            entry = self.cache[src_ip]
-            
-            # Check expiration
-            if (datetime.now() - entry['timestamp']).total_seconds() > self.ttl:
-                del self.cache[src_ip]
-                self.stats['misses'] += 1
-                return None
-            
-            # Cache hit
-            self.stats['hits'] += 1
-            self.stats['ml_calls_saved'] += 1
-            entry['hit_count'] += 1
-            entry['last_seen'] = datetime.now()
-            
-            return entry.copy()  # Return copy to avoid external modification
-    
-    def set(self, src_ip, attack_type, confidence):
-        """Cache attack detection (thread-safe)"""
-        if confidence < CACHE_MIN_CONFIDENCE:
+            if src_ip in self.cache:
+                entry = self.cache[src_ip]
+                now = time.time()
+                if now > entry['expiry']:
+                    del self.cache[src_ip]
+                    return None
+                entry['hits'] += 1
+                return entry['data'].copy()
+        return None
+
+    def set(self, src_ip, result):
+        if not result.get('is_attack') or result.get('confidence', 0) < self.min_conf:
             return
         
+        session_id = result.get('session_id')
+        if not session_id:
+            session_id = get_attack_session_id(src_ip, result['attack_type'])
+        
+        cache_data = {
+            'is_attack': True,
+            'attack_type': result['attack_type'],
+            'confidence': result['confidence'],
+            'session_id': session_id,
+            'verdict': 'Cached Attack',
+            'from_cache': True 
+        }
+
         with self.lock:
-            if src_ip not in self.cache:
-                self.cache[src_ip] = {
-                    'attack_type': attack_type,
-                    'confidence': confidence,
-                    'timestamp': datetime.now(),
-                    'first_seen': datetime.now(),
-                    'last_seen': datetime.now(),
-                    'hit_count': 0,
-                    'total_flows': 1
-                }
-                self.stats['unique_attackers'] += 1
-                logger.warning(
-                    f"🔴 NEW ATTACKER CACHED: {src_ip} → {attack_type} "
-                    f"(conf={confidence:.3f})"
-                )
-            else:
-                entry = self.cache[src_ip]
-                entry['confidence'] = max(entry['confidence'], confidence)
-                entry['timestamp'] = datetime.now()
-                entry['total_flows'] += 1
-    
-    def cleanup(self):
-        """Remove expired entries (thread-safe)"""
-        with self.lock:
-            now = datetime.now()
-            expired = [
-                ip for ip, e in self.cache.items()
-                if (now - e['timestamp']).total_seconds() > self.ttl
-            ]
-            
-            for ip in expired:
-                logger.info(f"🧹 Expired cache for {ip}")
-                del self.cache[ip]
-            
-            return len(expired)
-    
-    def get_summary(self):
-        """Get cache statistics summary (thread-safe)"""
-        with self.lock:
-            total_requests = self.stats['hits'] + self.stats['misses']
-            hit_rate = (self.stats['hits'] / total_requests * 100) \
-                       if total_requests > 0 else 0
-            
-            return {
-                'cache_size': len(self.cache),
-                'hit_rate': f"{hit_rate:.1f}%",
-                'ml_calls_saved': self.stats['ml_calls_saved'],
-                'unique_attackers': self.stats['unique_attackers']
+            self.cache[src_ip] = {
+                'data': cache_data,
+                'expiry': time.time() + self.ttl,
+                'hits': 0
             }
 
+    # [NEW] Hàm xóa cache cụ thể
+    def invalidate(self, src_ip):
+        with self.lock:
+            if src_ip in self.cache:
+                del self.cache[src_ip]
+                return True
+        return False
+
+    def cleanup(self):
+        with self.lock:
+            now = time.time()
+            expired = [ip for ip, e in self.cache.items() if now > e['expiry']]
+            for ip in expired: del self.cache[ip]
+            if expired:
+                logger.info(f"🧹 Cache Cleanup: Removed {len(expired)} expired IPs")
 
 # ==========================================
-# WINDOW BUFFER (ENHANCED)
+# 2. CONTEXT MANAGER
 # ==========================================
-class WindowBuffer:
-    """Time-based window buffer for flow aggregation"""
-    
-    def __init__(self, window_size_seconds=10):
-        self.window_size = timedelta(seconds=window_size_seconds)
-        self.flows = []
-        self.window_start = None
-        self.window_end = None
-    
-    def add_flow(self, flow_dict):
-        """Add flow to window buffer with enhanced debugging"""
-        raw_ts = flow_dict.get('ts')
-        if not raw_ts:
-            logger.debug(f"❌ Flow missing 'ts' field: {list(flow_dict.keys())[:5]}")
-            return False
+class FlowContextManager:
+    def __init__(self):
+        self.buffer = {} 
+        self.last_cleanup = time.time()
         
-        try:
-            # ✅ Handle both seconds and milliseconds timestamps
-            if isinstance(raw_ts, (int, float)):
-                ts_float = float(raw_ts)
-                if ts_float > 1e12:  # Likely milliseconds
-                    ts = datetime.fromtimestamp(ts_float / 1000)
-                    logger.debug(f"Converted ms timestamp: {ts_float} → {ts}")
-                else:
-                    ts = datetime.fromtimestamp(ts_float)
-            else:
-                ts = date_parser.parse(str(raw_ts))
+    def add_context(self, uid, log_type, data):
+        if uid not in self.buffer:
+            self.buffer[uid] = {'timestamp': time.time()}
+        if log_type == 'dns':
+            if 'query' in data: self.buffer[uid]['query'] = data['query']
+        elif log_type == 'http':
+            if 'uri' in data: self.buffer[uid]['uri'] = data['uri']
+            if 'method' in data: self.buffer[uid]['method'] = data['method']
             
-            logger.debug(f"✓ Parsed timestamp: {ts} (raw: {raw_ts})")
-        except Exception as e:
-            logger.warning(f"❌ Timestamp parse failed: {e} (raw: {raw_ts})")
-            return False
-        
-        flow_dict['ts'] = ts
-        
-        # Initialize window on first flow
-        if self.window_start is None:
-            self.window_start = ts
-            self.window_end = ts + self.window_size
-            logger.info(f"🪟 New window created: {self.window_start} → {self.window_end}")
-        
-        # Check if flow belongs to current window
-        if ts < self.window_end:
-            self.flows.append(flow_dict)
-            logger.debug(f"✓ Flow added to window (total: {len(self.flows)})")
-            return True
-        else:
-            logger.info(
-                f"⏭️ Flow outside window: {ts} >= {self.window_end} "
-                f"(current window has {len(self.flows)} flows)"
-            )
-            return False
-    
-    def is_ready(self):
-        return len(self.flows) > 0
-    
-    def get_flows(self):
-        return self.flows
-    
-    def clear(self):
-        logger.debug(f"🧹 Clearing window buffer ({len(self.flows)} flows)")
-        self.flows = []
-        self.window_start = None
-        self.window_end = None
+    def pop_context(self, uid):
+        return self.buffer.pop(uid, {})
 
+    def cleanup(self):
+        now = time.time()
+        if now - self.last_cleanup < 60: return 
+        expired = [uid for uid, ctx in self.buffer.items() if now - ctx['timestamp'] > 60]
+        for uid in expired: del self.buffer[uid]
+        self.last_cleanup = now
 
 # ==========================================
-# MAIN AGGREGATOR
+# 3. MAIN STREAM AGGREGATOR
 # ==========================================
 class StreamAggregator:
-    """Main Stream Aggregator with intelligent caching and aggregation"""
-    
     def __init__(self):
         self.running = False
         self.consumer = None
         self.producer = None
-        self.buffer = WindowBuffer(window_size_seconds=WINDOW_SIZE_SECONDS)
+        self.flow_buffer = [] 
+        self.active_flow_indices = {} 
+        self.context_manager = FlowContextManager()
         
-        self.feature_engineer = StreamFeatureEngineer(encoder_path=ENCODER_PATH)
-        self.http_client = httpx.AsyncClient(timeout=120.0)
-        
-        self.attack_cache = AttackCache(ttl_seconds=CACHE_TTL_SECONDS)
-        
-        self.stats = {
-            'consumed': 0, 'windows_processed': 0,
-            'attacks_detected': 0, 'alerts_sent': 0,
-            'xai_queued': 0, 'errors': 0
-        }
-    
-    def setup_kafka(self):
-        """Initialize Kafka consumer and producer"""
-        conf_c = {
-            'bootstrap.servers': KAFKA_BOOTSTRAP,
-            'group.id': CONSUMER_GROUP,
-            'auto.offset.reset': 'latest',
-            'enable.auto.commit': True
-        }
-        self.consumer = Consumer(conf_c)
-        self.consumer.subscribe([INPUT_TOPIC])
-        
-        self.producer = Producer({'bootstrap.servers': KAFKA_BOOTSTRAP})
-        logger.info(f"✓ Kafka Connected (topic: {INPUT_TOPIC})")
-    
-    def compute_behavioral(self, df):
-        """Compute behavioral features for window"""
-        if df.empty:
-            return df
-        
-        src_stats = df.groupby('id.orig_h').agg(
-            src_conn_count=('id.orig_h', 'size'),
-            src_unique_dests=('id.resp_h', 'nunique'),
-            src_unique_ports=('id.resp_p', 'nunique'),
-            src_service_diversity=('service', 'nunique')
-        ).reset_index()
-        
-        dst_stats = df.groupby('id.resp_h').size().reset_index(
-            name='dst_conn_count'
+        self.feature_engineer = NIDSFeatureEngineer(
+            time_window=f"{WINDOW_SIZE_SECONDS}s",
+            encoder_path=ENCODER_PATH,
+            model_type='if' 
         )
         
-        df = df.merge(src_stats, on='id.orig_h', how='left')
-        df = df.merge(dst_stats, on='id.resp_h', how='left')
-        
-        return df.fillna(0)
-    
-    async def predict_batch(self, features_df):
-        """Call ML API for batch prediction"""
         try:
-            payload = {
-                'samples': [
-                    {'features': dict(zip(features_df.columns, r))}
-                    for r in features_df.values.tolist()
-                ]
-            }
-            resp = await self.http_client.post(
-                f"{ML_API_URL}/predict_batch",
-                json=payload
-            )
+            lgbm_feats = self.feature_engineer.FEATURES_LGBM
+            if_feats = self.feature_engineer.FEATURES_IF
+            hybrid_features = list(set(lgbm_feats + if_feats))
+            self.feature_engineer.feature_columns = hybrid_features
+            self.lgbm_features_list = lgbm_feats
+            logger.info(f"🔧 Hybrid Mode Enabled: {len(hybrid_features)} features")
+        except AttributeError:
+            logger.error("❌ Feature Engineer Error: Update feature_engineering.py")
+            exit(1)
+
+        self.http_client = httpx.AsyncClient(timeout=30.0)
+        self.attack_cache = AttackCache(ttl_seconds=CACHE_TTL_SECONDS, min_conf=CACHE_MIN_CONFIDENCE)
+        
+        self.active_sessions = {}
+        self.stats = {'consumed': 0, 'cache_hits': 0, 'reverified': 0, 'suppressed': 0, 'api_calls': 0, 'summaries': 0}
+        self.last_cleanup = time.time()
+
+    def setup_kafka(self):
+        conf = {
+            'bootstrap.servers': KAFKA_BOOTSTRAP,
+            'group.id': CONSUMER_GROUP,
+            'auto.offset.reset': 'latest'
+        }
+        self.consumer = Consumer(conf)
+        self.consumer.subscribe([INPUT_TOPIC])
+        self.producer = Producer({'bootstrap.servers': KAFKA_BOOTSTRAP})
+        logger.info(f"✅ Kafka Connected. Topic: {INPUT_TOPIC}")
+
+    async def predict_batch(self, features_df):
+        try:
+            missing_cols = set(self.lgbm_features_list) - set(features_df.columns)
+            if missing_cols:
+                logger.error(f"❌ Missing columns: {missing_cols}")
+                for c in missing_cols: features_df[c] = 0
+
+            api_df = features_df[self.lgbm_features_list].copy()
+            api_df = api_df.replace([np.inf, -np.inf], 0).fillna(0)
+            
+            for col in api_df.columns:
+                if pd.api.types.is_datetime64_any_dtype(api_df[col]):
+                    api_df[col] = api_df[col].astype(str)
+
+            features_list = api_df.to_dict(orient='records')
+            payload = {'samples': [{'features': f} for f in features_list]}
+            
+            resp = await self.http_client.post(f"{ML_API_URL}/predict_batch", json=payload)
             
             if resp.status_code == 200:
                 return resp.json().get('predictions', [])
             else:
-                logger.error(f"ML API returned {resp.status_code}")
                 return None
-        
         except Exception as e:
             logger.error(f"ML API Error: {e}")
             return None
-       
-    async def process_window(self):
-        """
-        ✅ FIXED: Main window processing with corrected index mapping
-        """
-        flows = self.buffer.get_flows()
-        if not flows:
-            return
-        
-        logger.info(
-            f"📦 Window: {len(flows)} flows | "
-            f"{self.attack_cache.get_summary()}"
-        )
-        
+
+    def clean_payload(self, payload):
+        for field in DROP_FIELDS: payload.pop(field, None)
+        return payload
+
+    def sanitize_for_json(self, data):
+        if isinstance(data, dict): return {k: self.sanitize_for_json(v) for k, v in data.items()}
+        elif isinstance(data, list): return [self.sanitize_for_json(v) for v in data]
+        elif isinstance(data, (np.bool_, bool)): return bool(data)
+        elif isinstance(data, (np.integer, int)): return int(data)
+        elif isinstance(data, (np.floating, float)): 
+            if math.isnan(data) or math.isinf(data): return 0.0
+            return float(data)
+        elif isinstance(data, np.ndarray): return self.sanitize_for_json(data.tolist())
+        return data
+
+    def ensure_iso_timestamp(self, ts_value):
         try:
-            # ========================================
-            # STEP 1: Prepare Data
-            # ========================================
-            flows_df = pd.DataFrame(flows)
+            if isinstance(ts_value, (int, float)): return datetime.fromtimestamp(ts_value).isoformat()
+            if isinstance(ts_value, datetime): return ts_value.isoformat()
+            if isinstance(ts_value, str): return ts_value.replace(' ', 'T') 
+            return datetime.utcnow().isoformat() 
+        except:
+            return datetime.utcnow().isoformat()
+
+    def cleanup_states(self):
+        now = time.time()
+        if now - self.last_cleanup > 60: 
+            self.attack_cache.cleanup()
+            current_time = datetime.utcnow()
             
-            meta_cols = [
-                'ts', 'uid', 'id.orig_h', 'id.resp_h', 'id.resp_p',
-                'proto', 'service', 'duration', 'orig_bytes', 'resp_bytes',
-                'conn_state', 'orig_pkts', 'resp_pkts'
+            if len(self.active_sessions) > MAX_ACTIVE_SESSIONS:
+                sorted_sessions = sorted(self.active_sessions.items(), key=lambda item: item[1] or datetime.min)
+                cutoff = int(MAX_ACTIVE_SESSIONS * 0.8)
+                self.active_sessions = dict(sorted_sessions[-cutoff:])
+
+            expired_sessions = [
+                sid for sid, last_seen in self.active_sessions.items()
+                if last_seen and (current_time - last_seen).total_seconds() > 3600
             ]
-            for c in meta_cols:
-                if c not in flows_df.columns:
-                    flows_df[c] = None
+            for sid in expired_sessions:
+                del self.active_sessions[sid]
             
-            flows_with_behavior = self.compute_behavioral(flows_df)
-            features_df_all = self.feature_engineer.extract_features(flows_with_behavior)
-            # ========================================
-            # STEP 2: Cache-based Routing
-            # ========================================
-            indices_need_ml = []
-            final_results = [None] * len(flows)
-            
-            for i, row in flows_with_behavior.iterrows():
-                src_ip = row.get('id.orig_h')
-                cached = self.attack_cache.get(src_ip)
-                
-                if cached:
-                    # CACHE HIT
-                    final_results[i] = {
-                        'is_attack': True,
-                        'attack_type': cached['attack_type'],
-                        'confidence': cached['confidence'],
-                        'attack_probability': cached['confidence'],
-                        'predicted_class': -1,
-                        'method': 'CACHE',
-                        'anomaly_score': 0.0, 'is_anomaly': False
-                    }
-                else:
-                    # CACHE MISS
-                    indices_need_ml.append(i)
-            
-            # ========================================
-            # STEP 3: ML Prediction for Cache Misses
-            # ========================================
-            # ✅ FIX #1: Create index mapping for ML predictions
-            index_mapping = {}  # ml_result_index -> original_flow_index
-            
-            if indices_need_ml:
-                df_for_ml = flows_with_behavior.iloc[indices_need_ml]
-                features_df = self.feature_engineer.extract_features(df_for_ml)
-                
-                # Create explicit mapping
-                for ml_idx, original_idx in enumerate(indices_need_ml):
-                    index_mapping[ml_idx] = original_idx
-                
-                logger.info(
-                    f"🧠 Calling ML for {len(indices_need_ml)} uncached flows..."
-                )
-                predictions = await self.predict_batch(features_df)
-                
-                if predictions:
-                    # ✅ FIXED: Use correct index mapping
-                    for ml_idx, pred in enumerate(predictions):
-                        original_idx = index_mapping[ml_idx]
-                        
-                        # Update cache if high-confidence attack
-                        if pred['is_attack'] and \
-                           pred['confidence'] > CACHE_UPDATE_CONFIDENCE:
-                            ip = flows_with_behavior.iloc[original_idx].get(
-                                'id.orig_h'
-                            )
-                            if ip:
-                                self.attack_cache.set(
-                                    ip,
-                                    pred['attack_type'],
-                                    pred['confidence']
-                                )
-                        
-                        final_results[original_idx] = {
-                            'is_attack': pred['is_attack'],
-                            'attack_type': pred['attack_type'],
-                            'confidence': float(pred['confidence']),
-                            'attack_probability': float(
-                                pred.get('attack_probability', 0)
-                            ),
-                            'predicted_class': pred['predicted_class'],
-                            'method': 'ML',
-                            'cache_metadata': None,
-                            # 🌟 THÊM HAI TRƯỜNG NÀY TỪ PREDICTION
-                            'anomaly_score': float(pred.get('anomaly_score', 0.0)),
-                            'is_anomaly': pred.get('is_anomaly', False)
-                        }
-                else:
-                    # ML FAILED - Fallback
-                    logger.error(
-                        f"ML API failed for {len(indices_need_ml)} flows"
-                    )
-                    for original_idx in indices_need_ml:
-                        final_results[original_idx] = {
-                            'is_attack': False,
-                            'attack_type': 'BENIGN',
-                            'confidence': 0.0,
-                            'attack_probability': 0.0,
-                            'predicted_class': 0,
-                            'method': 'ML_FAILED',
-                            'cache_metadata': None
-                        }
-            
-            # ========================================
-            # STEP 4: SMART AGGREGATION
-            # ========================================
-            attack_groups = {}
-            benign_count = 0
-            
-            for i, result in enumerate(final_results):
-                # ✅ FIX #3: Proper None/empty check
-                if result is None or not isinstance(result, dict):
-                    logger.warning(f"Invalid result at index {i}: {result}")
-                    continue
-                
-                meta = flows_df.iloc[i]
-                b_row = flows_with_behavior.iloc[i]
-                
-                # --- A. BENIGN: Send individual ---
-                if not result.get('is_attack', False):
-                    benign_count += 1
-                    
-                    event = {
-                        'timestamp': datetime.utcnow().isoformat(),
-                        'log_type': 'flow',
-                        'window_start': self.buffer.window_start.isoformat(),
-                        'src_ip': safe_str(meta.get('id.orig_h')),
-                        'dst_ip': safe_str(meta.get('id.resp_h')),
-                        'dst_port': int(safe_num(meta.get('id.resp_p'))),
-                        'proto': safe_str(meta.get('proto')),
-                        'service': safe_str(meta.get('service')),
-                        'uid': safe_str(meta.get('uid')),
-                        'duration': float(safe_num(meta.get('duration'))),
-                        'orig_bytes': int(safe_num(meta.get('orig_bytes'))),
-                        'resp_bytes': int(safe_num(meta.get('resp_bytes'))),
-                        'conn_state': safe_str(meta.get('conn_state')),
-                        'src_conn_count': int(
-                            safe_num(b_row.get('src_conn_count'))
-                        ),
-                        'is_attack': False,
-                        'attack_type': 'BENIGN',
-                        'confidence': result['confidence'],
-                        'detection_method': result['method'],
-                        'anomaly_score': float(pred.get('anomaly_score', 0.0)),                      
-                    }
-                    
-                    self.producer.produce(
-                        OUTPUT_TOPIC,
-                        json.dumps(event).encode('utf-8')
-                    )
-                    continue
-                
-                # --- B. ATTACK: Aggregate ---
-                src_ip = safe_str(meta.get('id.orig_h'))
-                attack_type = result['attack_type']
-                key = (src_ip, attack_type)
-                
-                # ✅ FIX #2: Use centralized feature extraction
-                encoded_features_row = features_df_all.iloc[i].to_dict()
-                clean_features = {k: float(v) if isinstance(v, (np.float32, np.float64, np.integer)) else v for k, v in encoded_features_row.items()}
+            self.last_cleanup = now
 
-                # Initialize attack group
-                if key not in attack_groups:
-                    session_id = get_attack_session_id(src_ip, attack_type)
-                    attack_groups[key] = {
-                        'timestamp': datetime.utcnow().isoformat(),
-                        'log_type': 'alert_summary',
-                        'attack_session_id': session_id,
-                        'first_seen': datetime.utcnow().isoformat(),
-                        'last_updated': datetime.utcnow().isoformat(),
-                        'window_start': self.buffer.window_start.isoformat(),
-                        'window_end': (
-                            self.buffer.window_start +
-                            timedelta(seconds=WINDOW_SIZE_SECONDS)
-                        ).isoformat(),
-                        'src_ip': src_ip,
-                        'attack_type': attack_type,
-                        'is_attack': True,
-                        'detection_method': result['method'],
-                        'flow_count': 0,
-                        'total_orig_bytes': 0,
-                        'total_resp_bytes': 0,
-                        'sum_duration': 0.0,
-                        'avg_confidence': 0.0,
-                        'sum_anomaly_score': 0.0,
-                        'anomaly_flow_count': 0,
-                        'protocols': set(),
-                        'services': set(),
-                        'target_ips_tracking': set(),
-                        'target_ports_tracking': set(),
-                        'target_overflow': False,
-                        'sample_targets': [],
-                        'best_candidate': None
-                    }
-                
-                group = attack_groups[key]
-                group['last_updated'] = datetime.utcnow().isoformat()
-                
-                # Accumulate metrics
-                group['flow_count'] += 1
-                group['total_orig_bytes'] += int(
-                    safe_num(meta.get('orig_bytes'))
-                )
-                group['total_resp_bytes'] += int(
-                    safe_num(meta.get('resp_bytes'))
-                )
-                group['sum_duration'] += float(safe_num(meta.get('duration')))
-                if result.get('is_anomaly', False):
-                    group['sum_anomaly_score'] += result.get('anomaly_score', 0.0)
-                    group['anomaly_flow_count'] += 1
-                # Context tracking
-                proto = safe_str(meta.get('proto'))
-                service = safe_str(meta.get('service'))
-                if proto != '-':
-                    group['protocols'].add(proto)
-                if service != '-':
-                    group['services'].add(service)
-                
-                # Target tracking with overflow protection
-                dst_ip = safe_str(meta.get('id.resp_h'))
-                dst_port = int(safe_num(meta.get('id.resp_p')))
-                
-                if len(group['target_ips_tracking']) < MAX_UNIQUE_TRACKING:
-                    group['target_ips_tracking'].add(dst_ip)
-                else:
-                    group['target_overflow'] = True
-                
-                if len(group['target_ports_tracking']) < MAX_UNIQUE_TRACKING:
-                    group['target_ports_tracking'].add(dst_port)
-                
-                # Incremental average confidence
-                curr_sum = group['avg_confidence'] * (group['flow_count'] - 1)
-                group['avg_confidence'] = (
-                    (curr_sum + result['confidence']) / group['flow_count']
-                )
-                
-                # Sample targets
-                if len(group['sample_targets']) < 5:
-                    target = f"{dst_ip}:{dst_port}"
-                    if target not in group['sample_targets']:
-                        group['sample_targets'].append(target)
-                
-                # ✅ FIX #4: Track representative flows correctly
-                flow_record = {
-                    'flow_id': safe_str(meta.get('uid')),
-                    'timestamp': str(meta.get('ts')),
-                    'dst_ip': dst_ip,
-                    'dst_port': dst_port,
-                    'confidence': result['confidence'],
-                    'ml_features': clean_features
-                }
-                
-                current_best = group['best_candidate']
-                if current_best is None or result['confidence'] > current_best['confidence']:
-                    group['best_candidate'] = flow_record
-            
-            # ========================================
-            # STEP 5: Flush Aggregated Alerts
-            # ========================================
-            alerts_sent = 0
-            xai_queued = 0
-            
-            for group in attack_groups.values():
-                # Select Representatives
-                best_flow = group['best_candidate']
-                representative_flows = []
-                
-                if best_flow:
-                    # Gán lý do chọn (mặc định là highest_confidence)
-                    best_flow['selection_reason'] = 'highest_confidence'
-                    representative_flows.append(best_flow)
+    async def process_window(self):
+        if not self.flow_buffer: return
+        
+        window_stats = {
+            'flows': len(self.flow_buffer),
+            'hits': 0, 'reverified': 0, 'api_calls': 0, 'suppressed': 0, 'summaries': 0
+        }
+        
+        current_flows = list(self.flow_buffer)
+        self.flow_buffer = []
+        self.active_flow_indices = {} 
+        
+        logger.info(f"📦 Processing Window: {len(current_flows)} flows")
+        
+        flows_to_predict = []
+        indices_to_predict = []
+        final_results = [None] * len(current_flows)
+        
+        cache_aggregator = defaultdict(lambda: {
+            'count': 0, 'bytes': 0, 'first_ts': None, 'last_ts': None, 
+            'src_ip': None, 'attack_type': None, 'confidence': 0.0
+        })
 
-                # Finalize group data
-                del group['best_candidate'] # Xóa biến tạm
-                group['protocols'] = list(group['protocols'])
-                group['services'] = list(group['services'])
-                group['unique_dst_ip_count'] = len(group['target_ips_tracking'])
-                group['unique_dst_port_count'] = len(group['target_ports_tracking'])
-                del group['target_ips_tracking']
-                del group['target_ports_tracking']
-                
-                group['severity_score'] = calculate_attack_severity(group)
-                group['avg_anomaly_score'] = group['sum_anomaly_score'] / group['anomaly_flow_count'] if group['anomaly_flow_count'] > 0 else 0.0
-                del group['sum_anomaly_score']
-                del group['anomaly_flow_count']
-
-                # --- SPLIT PAYLOADS ---
-                
-                # A. Send clean summary to ES (ml-predictions)
-                # Remove heavy feature data
-                es_payload = group.copy()
-                # (No representative features in group dict anymore to delete)
-                
-                self.producer.produce(OUTPUT_TOPIC, json.dumps(es_payload).encode('utf-8'))
-                alerts_sent += 1
-                
-                # B. Send full details to XAI (xai-queue)
-                if group['severity_score'] >= 0:
-                    xai_payload = {
-                        'session_id': group['attack_session_id'],
-                        'src_ip': group['src_ip'],
-                        'attack_type': group['attack_type'],
-                        'severity': group['severity_score'],
-                        'flow_count': group['flow_count'],
-                        'avg_confidence': group['avg_confidence'],
-                        'sample_targets': group['sample_targets'],
-                        'timestamp': group['timestamp'],
-                        # ⭐️ Only sent to XAI queue
-                        'representative_flows': representative_flows 
-                    }
-                    self.producer.produce(XAI_QUEUE_TOPIC, json.dumps(xai_payload).encode('utf-8'))
-                    xai_queued += 1
-                    logger.warning(f"⚡ HIGH SEVERITY: {group['attack_type']} (Score={group['severity_score']}) -> XAI Queued")
-
-            self.producer.flush()
-            self.stats['windows_processed'] += 1
-            self.stats['attacks_detected'] += len(attack_groups)
+        # --- 1. CACHE FILTERING & RE-VERIFY ---
+        for idx, flow in enumerate(current_flows):
+            src_ip = flow.get('id.orig_h')
+            cached_result = self.attack_cache.get(src_ip)
             
-            if alerts_sent > 0:
-                logger.warning(f"🚨 ATTACKS: {alerts_sent} alerts | Benign: {benign_count} | XAI: {xai_queued}")
+            should_reverify = False
+            if cached_result:
+                if random.random() < CACHE_REVERIFY_RATE:
+                    should_reverify = True
+                    window_stats['reverified'] += 1
+                    # Lưu lại state cũ để so sánh
+                    flow['_prev_session_id'] = cached_result.get('session_id')
+                    flow['_prev_attack_type'] = cached_result.get('attack_type')
+                
+                flow['_was_cached'] = True
+
+            if cached_result and not should_reverify:
+                session_id = cached_result.get('session_id')
+                if session_id:
+                    self.active_sessions[session_id] = datetime.utcnow()
+
+                agg = cache_aggregator[session_id]
+                agg['count'] += 1
+                bytes_in = flow.get('orig_bytes', 0) or 0
+                if isinstance(bytes_in, (int, float)): agg['bytes'] += bytes_in
+                
+                ts = flow.get('ts')
+                if agg['first_ts'] is None: agg['first_ts'] = ts
+                agg['last_ts'] = ts
+                
+                agg['src_ip'] = src_ip
+                agg['attack_type'] = cached_result['attack_type']
+                agg['confidence'] = cached_result['confidence']
+                
+                final_results[idx] = cached_result
+                window_stats['hits'] += 1
+                
             else:
-                logger.info(f"✓ Clean window: {len(flows)} benign flows")
-                
-            if self.stats['windows_processed'] % 10 == 0:
-                self.attack_cache.cleanup()
+                flows_to_predict.append(flow)
+                indices_to_predict.append(idx)
 
-        except Exception as e:
-            logger.error(f"Window processing error: {e}", exc_info=True)
-            self.stats['errors'] += 1
-        finally:
-            self.buffer.clear()
-    
+        # --- 2. ML INFERENCE ---
+        df_all_raw = pd.DataFrame(current_flows)
+        df_all_features = self.feature_engineer.extract_all_features(df_all_raw)
+        
+        if flows_to_predict:
+            df_predict_features = df_all_features.iloc[indices_to_predict]
+            predictions = await self.predict_batch(df_predict_features)
+            window_stats['api_calls'] += 1
+            
+            if predictions:
+                for i, pred in enumerate(predictions):
+                    original_idx = indices_to_predict[i]
+                    flow = current_flows[original_idx]
+                    
+                    pred['from_cache'] = False 
+                    pred['_first_alert'] = False
+                    
+                    if pred.get('is_attack'):
+                        src_ip = flows_to_predict[i].get('id.orig_h')
+                        attack_type = pred['attack_type']
+                        
+                        # --- [NEW] DETECT SWITCHING ---
+                        # Nếu flow này trước đó được cache, và loại tấn công thay đổi
+                        if flow.get('_was_cached'):
+                            prev_type = flow.get('_prev_attack_type')
+                            if prev_type and prev_type != attack_type:
+                                logger.warning(f"🔄 Attack Switch Detected: {src_ip} ({prev_type} -> {attack_type})")
+                                # 1. Xóa cache cũ
+                                self.attack_cache.invalidate(src_ip)
+                                # 2. Force Session mới (sẽ được tạo ở dưới)
+                                # Logic bên dưới sẽ tự tạo session_id mới vì attack_type khác
+                        
+                        # Generate ID (New or Existing)
+                        session_id = get_attack_session_id(src_ip, attack_type)
+                        pred['session_id'] = session_id
+                        
+                        if session_id not in self.active_sessions:
+                            # NEW ATTACK SESSION
+                            self.active_sessions[session_id] = datetime.utcnow()
+                            pred['_first_alert'] = True 
+                            logger.warning(f"🚨 New Attack Session: {attack_type} from {src_ip}")
+                        else:
+                            # EXISTING SESSION
+                            self.active_sessions[session_id] = datetime.utcnow()
+                            pred['_first_alert'] = False
+                        
+                        self.attack_cache.set(src_ip, pred)
+                    
+                    final_results[original_idx] = pred
+            else:
+                for idx in indices_to_predict:
+                    final_results[idx] = {'is_attack': False, 'verdict': 'ML_ERROR', 'from_cache': False}
+
+        # --- 3. MERGE & PRODUCE ---
+        for i, result in enumerate(final_results):
+            if result is None: continue 
+            
+            is_attack = result.get('is_attack') or result.get('is_anomaly')
+            is_from_cache = result.get('from_cache', False)
+            is_first_alert = result.get('_first_alert', False)
+            
+            # --- SUPPRESSION LOGIC ---
+            # Suppress nếu: (Là Attack) VÀ (Từ Cache HOẶC (Session cũ VÀ Không phải alert đầu))
+            if is_attack and (is_from_cache or not is_first_alert):
+                window_stats['suppressed'] += 1
+                
+                # Cộng dồn vào Aggregator nếu là flow mới detect (nhưng thuộc session cũ)
+                if not is_from_cache: 
+                    session_id = result.get('session_id')
+                    if session_id:
+                        agg = cache_aggregator[session_id]
+                        agg['count'] += 1
+                        bytes_in = current_flows[i].get('orig_bytes', 0) or 0
+                        if isinstance(bytes_in, (int, float)): agg['bytes'] += bytes_in
+                        
+                        if agg['src_ip'] is None:
+                            agg['src_ip'] = current_flows[i].get('id.orig_h')
+                            agg['attack_type'] = result.get('attack_type')
+                            agg['confidence'] = result.get('confidence')
+                            agg['first_ts'] = current_flows[i].get('ts') 
+                        agg['last_ts'] = current_flows[i].get('ts')
+                
+                continue 
+            
+            # --- PRODUCE SINGLE ALERT (New Attack/Session or Benign) ---
+            flow_data = current_flows[i]
+            
+            # Lazy convert features
+            features_series = df_all_features.iloc[i]
+            features_dict = {}
+            for col, val in features_series.items():
+                if isinstance(val, (pd.Timestamp, datetime)):
+                    features_dict[col] = str(val)
+                else:
+                    features_dict[col] = val
+            
+            enriched_flow = {**flow_data, **features_dict, **result}
+            enriched_flow = self.clean_payload(enriched_flow)
+
+            ts_source = enriched_flow.get('timestamp') or enriched_flow.get('ts')
+            enriched_flow['timestamp'] = self.ensure_iso_timestamp(ts_source)
+            if 'ts' in enriched_flow: enriched_flow['ts'] = enriched_flow['timestamp']
+            
+            enriched_flow = self.sanitize_for_json(enriched_flow)
+
+            # A. Output Topic (Detailed Log)
+            es_payload = enriched_flow.copy()
+            es_payload.pop('features_vector', None)
+            self.producer.produce(OUTPUT_TOPIC, json.dumps(es_payload).encode('utf-8'))
+            
+            # B. XAI Queue (First Alert of Attack)
+            if is_attack and is_first_alert:
+                self.producer.produce(XAI_QUEUE_TOPIC, json.dumps(enriched_flow).encode('utf-8'))
+
+        # --- 4. PRODUCE SUMMARIES ---
+        for session_id, agg in cache_aggregator.items():
+            if agg['count'] == 0: continue
+            
+            last_ts = agg['last_ts'] or datetime.utcnow()
+            first_ts = agg['first_ts'] or last_ts
+
+            summary_log = {
+                'timestamp': self.ensure_iso_timestamp(last_ts),
+                'window_start': self.ensure_iso_timestamp(first_ts),
+                'log_type': 'flow_summary',
+                'id.orig_h': agg['src_ip'],
+                'attack_type': agg['attack_type'],
+                'is_attack': True,
+                'verdict': 'Cached Attack Summary',
+                'flow_count': agg['count'],
+                'total_bytes': agg['bytes'],
+                'session_id': session_id,
+                'confidence': agg['confidence'],
+                'detection_method': 'CACHE_AGGREGATED'
+            }
+            
+            summary_log = self.sanitize_for_json(summary_log)
+            self.producer.produce(OUTPUT_TOPIC, json.dumps(summary_log).encode('utf-8'))
+            window_stats['summaries'] += 1
+
+        self.producer.flush()
+        logger.info(
+            f"✅ Window Done. Flows: {window_stats['flows']} | "
+            f"Hits: {window_stats['hits']} | "
+            f"Suppressed: {window_stats['suppressed']} | "
+            f"Summaries: {window_stats['summaries']}"
+        )
+
+        self.stats['consumed'] += window_stats['flows']
+        self.stats['cache_hits'] += window_stats['hits']
+        self.stats['suppressed'] += window_stats['suppressed']
+
     async def consume_loop(self):
-        """Main Kafka consumption loop with enhanced debugging (FIXED WINDOW LOGIC)"""
-        logger.info("🚀 Starting consumption loop...")
-        last_flush = datetime.now()
+        logger.info("🚀 Starting Consumption Loop...")
+        last_flush = time.time()
         
         while self.running:
-            
-            # --- 1. Force flush on buffer overflow ---
-            if len(self.buffer.flows) >= MAX_BUFFER_SIZE:
-                logger.warning(
-                    f"⚠️ Buffer overflow ({len(self.buffer.flows)}), "
-                    f"FORCE FLUSHING..."
-                )
+            now = time.time()
+            if (now - last_flush) >= FLUSH_INTERVAL_SECONDS or len(self.flow_buffer) >= MAX_BUFFER_SIZE:
                 await self.process_window()
-                last_flush = datetime.now()
+                last_flush = now
+                self.context_manager.cleanup()
+                self.cleanup_states()
+
+            msg = self.consumer.poll(0.5)
+            if msg is None: continue
+            if msg.error():
+                if msg.error().code() != KafkaException._TIMEDOUT:
+                    logger.error(f"Kafka Error: {msg.error()}")
                 continue
-            
+
             try:
-                # --- 2. Poll Kafka Message ---
-                # Poll với timeout ngắn hơn để không bỏ lỡ interval check
-                msg = self.consumer.poll(0.5) 
-                
-                # --- 3. Periodic flush check ---
-                if (datetime.now() - last_flush).total_seconds() >= \
-                   FLUSH_INTERVAL_SECONDS:
-                    if self.buffer.is_ready():
-                        logger.info(
-                            f"⏱️ Flush interval reached. Processing "
-                            f"{len(self.buffer.flows)} flows..."
-                        )
-                        await self.process_window()
-                    last_flush = datetime.now()
-                
-                if not msg or msg.error():
-                    continue
-                
-                # --- 4. Decode and Parse Message ---
-                try:
-                    val = msg.value().decode('utf-8')
-                    data = json.loads(val)
-                    
-                    # Handle Filebeat wrapper (như logic cũ)
-                    if 'message' in data and isinstance(data['message'], str) and data['message']: # Thêm check data['message'] không rỗng
-                        try:
-                            log = json.loads(data['message'])
-                        except json.JSONDecodeError:
-                            log = data
-                            logger.debug("Filebeat message field is not JSON, using outer data.")
-                    else:
-                        log = data
-                    
-                    # DEBUG: Log first few flows
-                    if self.stats['consumed'] < 5:
-                        logger.info(f"🔍 Sample flow #{self.stats['consumed']+1}:")
-                        logger.info(f"    - ts: {log.get('ts')}")
-                        logger.info(f"    - src: {log.get('id.orig_h')}")
-                        logger.info(f"    - dst: {log.get('id.resp_h')}:{log.get('id.resp_p')}")
-                        logger.info(f"    - proto: {log.get('proto')}")
-                        
-                    self.stats['consumed'] += 1
-                    
-                    # --- 5. CORE LOGIC FIX: Try adding flow ---
-                    added = self.buffer.add_flow(log)
-                    
-                    if not added:
-                        # Flow không thuộc về cửa sổ hiện tại (quá muộn/quá sớm)
-                        logger.info(
-                            f"⏭️ Flow ts outside current window. Attempting flush..."
-                        )
-                        
-                        # Chỉ process window hiện tại nếu nó CÓ data
-                        if self.buffer.is_ready():
-                            await self.process_window()
-                        
-                        # Sau khi process/clear, thử thêm flow này lại lần nữa.
-                        # Lần này flow sẽ tạo cửa sổ mới
-                        added_retry = self.buffer.add_flow(log)
-                        
-                        if added_retry:
-                            logger.debug(
-                                f"✓ Flow successfully added to new window after flush."
-                            )
+                raw_val = msg.value().decode('utf-8')
+                record = json.loads(raw_val)
+                data = record.get('message', record)
+                if isinstance(data, str): 
+                    try: data = json.loads(data)
+                    except: data = record
+
+                uid = data.get('uid')
+                if 'ts' in data:
+                    try:
+                        ts_raw = data['ts']
+                        if isinstance(ts_raw, (int, float)):
+                            data['ts'] = datetime.fromtimestamp(float(ts_raw))
                         else:
-                            # Nếu lần 2 vẫn fail, khả năng cao do timestamp bị lỗi
-                            logger.warning(
-                                f"⚠️ Flow rejected twice! Invalid TS or parsing error: {log.get('ts')}"
-                            )
-                        
-                        last_flush = datetime.now()
-                        
-                except json.JSONDecodeError:
-                    logger.warning(f"❌ Could not parse JSON message: {msg.value().decode('utf-8')[:100]}...")
-                    self.stats['errors'] += 1
-                except Exception as e:
-                    logger.error(f"Error processing flow: {e}", exc_info=True)
-                    self.stats['errors'] += 1
-                        
-            except KafkaException as e:
-                if e.args[0].code() != KafkaException._TIMEDOUT:
-                    logger.error(f"Kafka error: {e}")
-                await asyncio.sleep(0.5)
+                            data['ts'] = date_parser.parse(str(ts_raw))
+                    except:
+                        data['ts'] = datetime.utcnow()
+
+                log_type = 'unknown'
+                if 'id.orig_h' in data and 'duration' in data: log_type = 'conn'
+                elif 'query' in data: log_type = 'dns'
+                elif 'uri' in data: log_type = 'http'
+                
+                if uid:
+                    if log_type == 'conn':
+                        context = self.context_manager.pop_context(uid)
+                        merged_flow = {**data, **context}
+                        self.flow_buffer.append(merged_flow)
+                        self.active_flow_indices[uid] = len(self.flow_buffer) - 1
+                    elif log_type in ['dns', 'http']:
+                        if uid in self.active_flow_indices:
+                            idx = self.active_flow_indices[uid]
+                            if idx < len(self.flow_buffer):
+                                if log_type == 'dns' and 'query' in data:
+                                    self.flow_buffer[idx]['query'] = data['query']
+                                elif log_type == 'http' and 'uri' in data:
+                                    self.flow_buffer[idx]['uri'] = data['uri']
+                        else:
+                            self.context_manager.add_context(uid, log_type, data)
+                self.stats['consumed'] += 1
             except Exception as e:
-                logger.error(f"Consume loop unexpected error: {e}", exc_info=True)
-                await asyncio.sleep(1)
+                logger.error(f"Consume Error: {e}")
 
     async def start(self):
-        """Start aggregator"""
         self.running = True
-        logger.info("="*60)
-        logger.info("STREAM AGGREGATOR v2.1.0 - DEBUG MODE")
-        logger.info("="*60)
-        logger.info(f"Window size: {WINDOW_SIZE_SECONDS}s")
-        logger.info(f"Flush interval: {FLUSH_INTERVAL_SECONDS}s")
-        logger.info(f"Cache TTL: {CACHE_TTL_SECONDS}s")
-        logger.info(f"Input topic: {INPUT_TOPIC}")
-        logger.info(f"Output topic: {OUTPUT_TOPIC}")
-        logger.info(f"ML API: {ML_API_URL}")
-        logger.info("="*60)
-        
         self.setup_kafka()
         await self.consume_loop()
 
     async def stop(self):
-        """Graceful shutdown"""
         self.running = False
-        logger.info("Stopping aggregator...")
-        
-        if self.consumer:
-            self.consumer.close()
-        
+        if self.consumer: self.consumer.close()
         await self.http_client.aclose()
-        
-        # Final stats
-        logger.info("="*60)
-        logger.info("FINAL STATISTICS")
-        logger.info("="*60)
-        logger.info(f"Flows consumed: {self.stats['consumed']}")
-        logger.info(f"Windows processed: {self.stats['windows_processed']}")
-        logger.info(f"Attacks detected: {self.stats['attacks_detected']}")
-        logger.info(f"Cache summary: {self.attack_cache.get_summary()}")
-        logger.info("="*60)
-
-
-# ==========================================
-# MAIN ENTRY POINT
-# ==========================================
-async def main():
-    agg = StreamAggregator()
-    loop = asyncio.get_running_loop()
-    
-    def shutdown():
-        asyncio.create_task(agg.stop())
-    
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, shutdown)
-    
-    await agg.start()
-
+        logger.info("🛑 Aggregator Stopped")
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    agg = StreamAggregator()
+    loop = asyncio.get_event_loop()
+    def signal_handler(): asyncio.create_task(agg.stop())
+    for sig in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(sig, signal_handler)
+    loop.run_until_complete(agg.start())
