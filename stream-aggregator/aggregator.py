@@ -56,7 +56,7 @@ ENCODER_PATH = os.getenv('ENCODER_PATH', '/opt/ml-nids/models/feature_schema_lgb
 
 # Cache & Session Settings
 CACHE_TTL_SECONDS = 300 
-CACHE_MIN_CONFIDENCE = 0.90
+CACHE_MIN_CONFIDENCE = 0.45
 CACHE_REVERIFY_RATE = float(os.getenv('CACHE_REVERIFY_RATE', '0.1'))
 MAX_ACTIVE_SESSIONS = 50000 
 
