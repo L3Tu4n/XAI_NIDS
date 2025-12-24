@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Stream Aggregator - SMART CACHE INVALIDATION (v7.10)
+Stream Aggregator - FRESH START LOGIC (v7.11)
 Updates:
-- ✅ LOGIC: Detect Attack Switching (e.g., PortScan -> SSH).
-- ✅ FIX: Invalidate old cache & Start fresh session on switch.
-- ✅ FIX: Force Detailed Alert for the switch event.
+- ✅ SIMPLIFIED: Removed complex switch-tracking fields.
+- ✅ LOGIC: If ML detects different attack -> Invalidate Cache -> Force Alert.
+- ✅ GOAL: Immediate detailed log for any attack change.
 """
 import os
 import json
@@ -67,6 +67,7 @@ DROP_FIELDS = ['agent', 'host', 'ecs', 'error', 'message', 'input', 'log', 'tags
 # ==========================================
 def get_attack_session_id(src_ip, attack_type):
     now = datetime.utcnow()
+    # Gom nhóm theo giờ
     time_bucket = now.strftime('%Y-%m-%d-%H')
     raw_str = f"{src_ip}-{attack_type}-{time_bucket}"
     return hashlib.md5(raw_str.encode()).hexdigest()
@@ -118,7 +119,7 @@ class AttackCache:
                 'hits': 0
             }
 
-    # [NEW] Hàm xóa cache cụ thể
+    # Hàm xóa cache (để reset khi đổi attack)
     def invalidate(self, src_ip):
         with self.lock:
             if src_ip in self.cache:
@@ -226,7 +227,6 @@ class StreamAggregator:
             payload = {'samples': [{'features': f} for f in features_list]}
             
             resp = await self.http_client.post(f"{ML_API_URL}/predict_batch", json=payload)
-            
             if resp.status_code == 200:
                 return resp.json().get('predictions', [])
             else:
@@ -309,16 +309,14 @@ class StreamAggregator:
             
             should_reverify = False
             if cached_result:
+                # 🎲 Xác suất 10% re-verify để check đổi attack
                 if random.random() < CACHE_REVERIFY_RATE:
                     should_reverify = True
                     window_stats['reverified'] += 1
-                    # Lưu lại state cũ để so sánh
-                    flow['_prev_session_id'] = cached_result.get('session_id')
-                    flow['_prev_attack_type'] = cached_result.get('attack_type')
-                
-                flow['_was_cached'] = True
+                    # Không cần lưu _prev_attack nữa, ta sẽ so sánh trực tiếp sau khi predict
 
             if cached_result and not should_reverify:
+                # HIT CACHE -> Auto Aggregate
                 session_id = cached_result.get('session_id')
                 if session_id:
                     self.active_sessions[session_id] = datetime.utcnow()
@@ -340,6 +338,7 @@ class StreamAggregator:
                 window_stats['hits'] += 1
                 
             else:
+                # MISS CACHE or RE-VERIFY
                 flows_to_predict.append(flow)
                 indices_to_predict.append(idx)
 
@@ -355,40 +354,47 @@ class StreamAggregator:
             if predictions:
                 for i, pred in enumerate(predictions):
                     original_idx = indices_to_predict[i]
-                    flow = current_flows[original_idx]
                     
                     pred['from_cache'] = False 
                     pred['_first_alert'] = False
                     
                     if pred.get('is_attack'):
                         src_ip = flows_to_predict[i].get('id.orig_h')
-                        attack_type = pred['attack_type']
+                        new_attack_type = pred['attack_type']
                         
-                        # --- [NEW] DETECT SWITCHING ---
-                        # Nếu flow này trước đó được cache, và loại tấn công thay đổi
-                        if flow.get('_was_cached'):
-                            prev_type = flow.get('_prev_attack_type')
-                            if prev_type and prev_type != attack_type:
-                                logger.warning(f"🔄 Attack Switch Detected: {src_ip} ({prev_type} -> {attack_type})")
-                                # 1. Xóa cache cũ
+                        # --- [LOGIC MỚI] CHECK THAY ĐỔI ATTACK ---
+                        # Lấy lại cache hiện tại để so sánh (vì có thể nó vừa được tạo ở window trước)
+                        current_cache = self.attack_cache.get(src_ip)
+                        
+                        is_fresh_attack = False
+                        
+                        if current_cache:
+                            # Nếu có Cache cũ, nhưng loại tấn công KHÁC nhau
+                            if current_cache['attack_type'] != new_attack_type:
+                                logger.warning(f"🔄 Attack Changed: {src_ip} ({current_cache['attack_type']} -> {new_attack_type})")
+                                # 1. Xóa cache cũ ngay lập tức
                                 self.attack_cache.invalidate(src_ip)
-                                # 2. Force Session mới (sẽ được tạo ở dưới)
-                                # Logic bên dưới sẽ tự tạo session_id mới vì attack_type khác
-                        
-                        # Generate ID (New or Existing)
-                        session_id = get_attack_session_id(src_ip, attack_type)
+                                # 2. Đánh dấu đây là tấn công mới toanh
+                                is_fresh_attack = True
+                        else:
+                            # Chưa có cache -> Tấn công mới
+                            is_fresh_attack = True
+
+                        # Tạo Session ID cho loại tấn công mới này
+                        session_id = get_attack_session_id(src_ip, new_attack_type)
                         pred['session_id'] = session_id
                         
-                        if session_id not in self.active_sessions:
-                            # NEW ATTACK SESSION
+                        # FORCE ALERT nếu là Fresh Attack hoặc Session chưa active
+                        if is_fresh_attack or session_id not in self.active_sessions:
                             self.active_sessions[session_id] = datetime.utcnow()
-                            pred['_first_alert'] = True 
-                            logger.warning(f"🚨 New Attack Session: {attack_type} from {src_ip}")
+                            pred['_first_alert'] = True # Bắt buộc gửi Alert
+                            logger.warning(f"🚨 FRESH ALERT: {new_attack_type} from {src_ip}")
                         else:
-                            # EXISTING SESSION
+                            # Đã active session đúng loại -> Suppress
                             self.active_sessions[session_id] = datetime.utcnow()
                             pred['_first_alert'] = False
                         
+                        # Cập nhật cache mới
                         self.attack_cache.set(src_ip, pred)
                     
                     final_results[original_idx] = pred
@@ -405,11 +411,11 @@ class StreamAggregator:
             is_first_alert = result.get('_first_alert', False)
             
             # --- SUPPRESSION LOGIC ---
-            # Suppress nếu: (Là Attack) VÀ (Từ Cache HOẶC (Session cũ VÀ Không phải alert đầu))
+            # Suppress nếu: Là Attack VÀ (Đến từ Cache HOẶC Không phải alert đầu tiên)
+            # Logic này đảm bảo: Nếu _first_alert = True (do Fresh Attack ở trên set), nó sẽ KHÔNG bị suppress.
             if is_attack and (is_from_cache or not is_first_alert):
                 window_stats['suppressed'] += 1
                 
-                # Cộng dồn vào Aggregator nếu là flow mới detect (nhưng thuộc session cũ)
                 if not is_from_cache: 
                     session_id = result.get('session_id')
                     if session_id:
@@ -427,10 +433,9 @@ class StreamAggregator:
                 
                 continue 
             
-            # --- PRODUCE SINGLE ALERT (New Attack/Session or Benign) ---
+            # --- PRODUCE ALERT (Fresh Attack / Benign) ---
             flow_data = current_flows[i]
             
-            # Lazy convert features
             features_series = df_all_features.iloc[i]
             features_dict = {}
             for col, val in features_series.items():
@@ -448,12 +453,12 @@ class StreamAggregator:
             
             enriched_flow = self.sanitize_for_json(enriched_flow)
 
-            # A. Output Topic (Detailed Log)
+            # A. Output Topic (Send As Raw Log)
             es_payload = enriched_flow.copy()
             es_payload.pop('features_vector', None)
             self.producer.produce(OUTPUT_TOPIC, json.dumps(es_payload).encode('utf-8'))
             
-            # B. XAI Queue (First Alert of Attack)
+            # B. XAI Queue (Only for Fresh Alert)
             if is_attack and is_first_alert:
                 self.producer.produce(XAI_QUEUE_TOPIC, json.dumps(enriched_flow).encode('utf-8'))
 
