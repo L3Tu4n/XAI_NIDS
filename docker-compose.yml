@@ -1,47 +1,44 @@
+version: '3.8'
+
 services:
   # ============================================
   # KAFKA BROKER (KRaft Mode - Apache Kafka 4.1.0)
-  # Host IP: 192.168.63.150
   # ============================================
   kafka:
     image: apache/kafka:4.1.0
     hostname: kafka
     container_name: kafka
     ports:
-      - "9092:9092"  # Internal listener + Host access
+      - "9092:9092"  # Internal
       - "9093:9093"  # Controller
-      - "9094:9094"  # External listener for Zeek VM (.129)
+      - "9094:9094"  # External (Cho Zeek/Filebeat từ máy khác)
     environment:
-      # KRaft configuration
       KAFKA_PROCESS_ROLES: 'broker,controller'
       KAFKA_NODE_ID: 1
       KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:9093'
       KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
-      
       CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
       
-      # Listeners configuration
+      # Listeners
       KAFKA_LISTENERS: 'INTERNAL://0.0.0.0:9092,CONTROLLER://kafka:9093,EXTERNAL://0.0.0.0:9094'
-      KAFKA_ADVERTISED_LISTENERS: 'INTERNAL://kafka:9092,EXTERNAL://192.168.63.150:9094'
+      KAFKA_ADVERTISED_LISTENERS: 'INTERNAL://kafka:9092,EXTERNAL://${HOST_IP}:9094'
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT'
       KAFKA_INTER_BROKER_LISTENER_NAME: 'INTERNAL'
       
-      # Topic settings
+      # Topic & Replication Settings (Merge từ file 1)
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       
-      # Performance tuning
+      # Performance Tuning (Lấy từ file 1)
       KAFKA_NUM_NETWORK_THREADS: 8
       KAFKA_NUM_IO_THREADS: 8
       KAFKA_SOCKET_SEND_BUFFER_BYTES: 102400
       KAFKA_SOCKET_RECEIVE_BUFFER_BYTES: 102400
-      KAFKA_LOG_RETENTION_HOURS: 168
-      
+      KAFKA_LOG_RETENTION_HOURS: 24
       KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
-    
     user: root
     volumes:
       - kafka-data:/tmp/kraft-combined-logs
@@ -88,6 +85,7 @@ services:
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=INFO
       - WORKERS=4
+      - MODEL_DIR=/opt/ml-nids/models
     restart: unless-stopped
     networks:
       - ml-nids-network
@@ -100,8 +98,6 @@ services:
 
   # ============================================
   # STREAM AGGREGATOR
-  # Reads from: zeek-logs (từ Filebeat)
-  # Writes to: ml-predictions (sau khi aggregate + ML)
   # ============================================
   stream-aggregator:
     build:
@@ -116,24 +112,20 @@ services:
     volumes:
       - ./models:/opt/ml-nids/models:ro
     environment:
-      # Kafka configuration
-      - ENCODER_PATH=/opt/ml-nids/models/feature_schema.pkl
+      - ENCODER_PATH=/opt/ml-nids/models/feature_schema_lgbm.pkl
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      
-      # Topic names - CORRECTED
-      - INPUT_TOPIC=zeek-conn              # Input từ Filebeat (tên topic chuẩn)
-      - OUTPUT_TOPIC=ml-predictions   
-      - XAI_QUEUE_TOPIC=xai-queue     # Output sau aggregate + ML
+    
+      - INPUT_TOPIC=zeek-raw
+      - OUTPUT_TOPIC=ml-predictions
+      - XAI_QUEUE_TOPIC=xai-queue
       - CONSUMER_GROUP=stream-aggregator-group
       
       # Window configuration
-      - WINDOW_SIZE_SECONDS=10             # 10 second window
-      - FLUSH_INTERVAL_SECONDS=5           # Check every 5s
-      - MAX_BUFFER_SIZE=1000               # Force flush at 1000 flows
+      - WINDOW_SIZE_SECONDS=10
+      - FLUSH_INTERVAL_SECONDS=5
+      - MAX_BUFFER_SIZE=1000
       
-      # ML API
       - ML_API_URL=http://ml-api:5000
-      
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
     networks:
@@ -146,8 +138,6 @@ services:
 
   # ============================================
   # ELASTICSEARCH CONSUMER
-  # Reads from: ml-predictions (sau Stream Aggregator)
-  # Writes to: Elasticsearch (192.168.63.134)
   # ============================================
   es-consumer:
     build:
@@ -160,24 +150,20 @@ services:
       stream-aggregator:
         condition: service_started
     environment:
-      # Kafka configuration
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_PREDICTIONS_TOPIC=ml-predictions  # CORRECTED: Đọc từ ml-predictions
+      - KAFKA_PREDICTIONS_TOPIC=ml-predictions
       - KAFKA_GROUP_ID=es-indexer-group
       
-      # Elasticsearch configuration (External server)
-      - ES_HOSTS=https://192.168.63.134:9200
+      # Elasticsearch Config (Lấy từ .env của file 2)
+      - ES_HOSTS=${ELASTIC_HOST}
+      - ES_USERNAME=${ELASTIC_USERNAME}
+      - ES_PASSWORD=${ELASTIC_PASSWORD}
       - ES_INDEX=ml-nids-alerts
-      - ES_USERNAME=elastic
-      - ES_PASSWORD=-B8Ph8fVTlnMPP-K7ffw
       
-      # Processing configuration
       - BATCH_SIZE=1000
       - FLUSH_INTERVAL=10
-      
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=INFO
-    
     restart: unless-stopped
     networks:
       - ml-nids-network
@@ -188,11 +174,8 @@ services:
           memory: 1G
 
   # ============================================
-  # XAI + LLM Sevice
-  # Reads from: ml-predictions (sau Stream Aggregator)
-  # Writes to: Elasticsearch (192.168.63.134)
+  # XAI + LLM Service
   # ============================================
-
   xai_llm_service:
     build: ./xai_llm_service
     container_name: xai_llm_service
@@ -206,17 +189,21 @@ services:
       - INPUT_TOPIC=xai-queue
       - CONSUMER_GROUP=xai-worker-group
       - MODEL_DIR=/opt/ml-nids/models
-      - ES_HOSTS=https://192.168.63.134:9200
+      
+      # Secrets & Connection (Lấy từ .env của file 2)
+      - ES_HOSTS=${ELASTIC_HOST}
+      - ES_USERNAME=${ELASTIC_USERNAME}
+      - ES_PASSWORD=${ELASTIC_PASSWORD}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      
       - ES_INDEX=ml-nids-alerts
-      - ES_USERNAME=elastic
-      - ES_PASSWORD=-B8Ph8fVTlnMPP-K7ffw
       - LLM_PROVIDER=gemini
-      - GEMINI_API_KEY=AIzaSyCCPbIZKK9hR2xyWnGa1t1xbW0y0ZnzZUE
       - XAI_DEDUP_HOURS=1
       - LOG_LEVEL=INFO
     restart: unless-stopped
     networks:
       - ml-nids-network
+
 volumes:
   kafka-data:
     driver: local
@@ -226,4 +213,4 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.20.0.0/16
+        - subnet: ${SUBNET_CIDR:-172.20.0.0/16}
