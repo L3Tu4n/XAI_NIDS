@@ -1,0 +1,17 @@
+[Unit]
+Description=Filebeat Kafka for Zeek Logs
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/share/filebeat/filebeat \
+  -c /etc/filebeat-kafka/filebeat.yml \
+  -path.home /usr/share/filebeat \
+  -path.config /etc/filebeat-kafka \
+  -path.data /var/lib/filebeat-kafka \
+  -path.logs /var/log/filebeat-kafka
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target

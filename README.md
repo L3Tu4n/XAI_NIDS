@@ -166,7 +166,7 @@ docker compose up -d --build
 ```
 Chạy script tạo topic:
 ```bash
-./scripts/test_pipeline.sh
+./scripts/create_topics.sh
 ```
 Khởi động lại docker
 ```bash
@@ -197,13 +197,7 @@ Ví dụ dùng `hydra`:
 hydra -l root -P password.txt ssh://<TARGET_IP>
 ```
 
-Hoặc dùng script test:
 
-```bash
-bash scripts/test_pipeline.sh
-```
-
----
 
 ## 8. Theo dõi kết quả
 
