@@ -75,19 +75,17 @@ ml-nids-project/
 Tùy chỉnh lại các trường Liên quan đến biến môi trường, IP các thành phần trong hệ thống
 
 ```env
-# Kafka
-KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+# Network
+HOST_IP=YOUR_HOST_IP
+SUBNET_CIDR=YOUR_SUBNET_CIDR
 
 # Elasticsearch
-ES_HOSTS=https://elasticsearch:9200
-ES_USERNAME=elastic
-ES_PASSWORD=changeme
+ELASTIC_HOST=https://elasticsearch:9200
+ELASTIC_USERNAME=elastic
+ELASTIC_PASSWORD=YOUR_ELASTIC_PASSWORD
 
-# LLM (chọn 1 trong 2)
-LLM_PROVIDER=gemini
-GEMINI_API_KEY=YOUR_GEMINI_API_KEY
-
-# OPENAI_API_KEY=YOUR_OPENAI_API_KEY
+# AI Configuration
+GROQ_API_KEY=YOUR_GROQ_API_KEY
 ```
 
 ⚠️ **Không commit file `.env` lên GitHub**.
