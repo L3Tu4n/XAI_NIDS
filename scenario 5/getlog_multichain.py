@@ -52,6 +52,46 @@ def should_push(date_str, ranges, singles):
         if s <= date_str <= e: return True
     return False
 
+def is_valid_date(date_str):
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+        return True
+    except:
+        return False
+
+def validate_state_config(config):
+    for stream, cfg in config.items():
+        # Kiểm tra single_dates
+        for d in cfg.get("single_dates", []):
+            if not is_valid_date(d):
+                raise ValueError(
+                    f"Định dạng ngày không hợp lệ trong single_dates "
+                    f"(stream: {stream}): {d}. Yêu cầu định dạng YYYY-MM-DD."
+                )
+
+        # Kiểm tra date_ranges
+        for r in cfg.get("date_ranges", []):
+            if not isinstance(r, list) or len(r) != 2:
+                raise ValueError(
+                    f"Cấu trúc date_ranges không hợp lệ "
+                    f"(stream: {stream}): {r}. Yêu cầu dạng [start_date, end_date]."
+                )
+
+            start, end = r
+
+            if not is_valid_date(start) or not is_valid_date(end):
+                raise ValueError(
+                    f"Định dạng ngày không hợp lệ trong date_ranges "
+                    f"(stream: {stream}): {r}. Yêu cầu định dạng YYYY-MM-DD."
+                )
+
+            if start > end:
+                raise ValueError(
+                    f"Khoảng ngày không hợp lệ trong date_ranges "
+                    f"(stream: {stream}): ngày bắt đầu lớn hơn ngày kết thúc."
+                )
+
+
 def load_state():
     if not os.path.exists(STATE_FILE):
         default = {s: {"date_ranges": [], "single_dates": []} for s in STREAMS}
@@ -61,10 +101,10 @@ def load_state():
         with open(STATE_FILE, "r") as f: return json.load(f)
     except: return None
 
-# --- Thay đổi ưu tiên hiển thị ---
 def send_log(data, stream):
     data["stream"] = stream
-    max_retries = 3    
+    max_retries = 3
+    
     for attempt in range(1, max_retries + 1):
         try:
             requests.post(LOGSTASH_URL, json=data, timeout=5).raise_for_status()
@@ -92,6 +132,13 @@ def save_fail(data, stream):
 # --- MAIN ---
 if __name__ == "__main__":
     config = load_state()
+
+try:
+    validate_state_config(config)
+except ValueError as e:
+    print(e)
+    exit(1)
+
     mode = "FILTER" if config else "PULL_ALL"
     
     if config:
