@@ -1,0 +1,48 @@
+- name: Giảm nhẹ tấn công DDoS SYN Flood
+  hosts: "{{ target | default('all') }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    protocol: "{{ protocol | lower }}"
+    source_ip: "{{ source_ip }}"
+    dest_port: "{{ dest_port }}"
+
+  tasks:
+    - name: Bật TCP SYN cookies
+      ansible.posix.sysctl:
+        name: net.ipv4.tcp_syncookies
+        value: '1'
+        sysctl_set: yes
+        state: present
+
+    - name: Chặn IP nguồn tấn công
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: "{{ protocol }}"
+        source: "{{ source_ip }}"
+        jump: DROP
+        comment: "Chặn IP nguồn DDoS SYN Flood"
+
+    - name: Cho phép gói SYN trong giới hạn tốc độ trên port đích
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: "{{ protocol }}"
+        destination_port: "{{ dest_port }}"
+        ctstate: NEW
+        limit: "100/sec"
+        limit_burst: 200
+        jump: ACCEPT
+        comment: "Giới hạn tốc độ SYN tới port {{ dest_port }}"
+    - name: Drop các gói SYN vượt ngưỡng
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ dest_port }}"
+        ctstate: NEW
+        jump: DROP
+        comment: "Drop SYN vượt giới hạn"
+
+    - name: Lưu rule iptables hiện tại
+      ansible.builtin.command: iptables-save
+      register: iptables_rules

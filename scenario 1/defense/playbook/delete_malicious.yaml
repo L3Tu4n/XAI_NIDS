@@ -1,0 +1,18 @@
+- name: Delete malicious file detected
+  hosts: "{{ target }}"
+  gather_facts: false
+  become: yes
+  tasks:
+    - name: Find malicious file in FTP directory
+      ansible.builtin.find:
+        paths: /home/ftp
+        patterns: "{{ file_name }}"
+        file_type: file
+      register: found_files
+
+    - name: Remove the malicious file
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ found_files.files }}"
+      when: found_files.matched > 0

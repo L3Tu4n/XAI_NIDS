@@ -1,0 +1,33 @@
+name: Detect and Block Unusual Port Connection
+type: any
+index: filebeat-*
+filter:
+  - term:
+      zeek.notice.note.keyword: "UnusualPort::Unusual_Port_Connection"
+alert:
+  - command
+  - email
+command:
+  - /bin/bash
+  - -lc
+  - |
+    ansible-playbook /home/l3tu4n/DACN/ansible/block_ip.yaml \
+      -i '%(source.ip)s,' \
+      --private-key=/home/l3tu4n/.ssh/id_rsa_elastalert2 \
+      -e "target_host=%(source.ip)s target=%(destination.ip)s"
+email:
+  - "22521603@gm.uit.edu.vn"
+alert_text: |
+  Unusual Port Connection Alert: {0}
+  Time: {1}
+  Source IP: {2}
+  Destination IP: {3}
+  Details: {4}
+  Action: Traffic from {2} to {3} has been automatically blocked via Ansible playbook. Please verify if this is a legitimate threat.
+alert_text_type: alert_text_only
+alert_text_args:
+  - "zeek.notice.note"
+  - "@timestamp"
+  - "source.ip"
+  - "destination.ip"
+  - "zeek.notice.msg"

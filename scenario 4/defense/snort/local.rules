@@ -1,0 +1,2 @@
+#DDoS Flood Detection (Internal Attacker)
+alert tcp any any -> $HOME_NET any (msg:"[DDoS] SYN Flood"; flow:stateless; flags:S; threshold:type both, track by_dst, count 100000, seconds 5; priority:1; classtype:attempted-dos; sid:1002001; rev:5;

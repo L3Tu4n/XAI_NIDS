@@ -1,0 +1,25 @@
+name: Network Scan Detected
+type: any
+index: filebeat-*
+filter:
+  - terms:
+      zeek.notice.note.keyword:
+        - "Scan::Port_Scan"
+        - "Scan::Address_Scan"
+        - "Scan::Random_Scan"
+alert:
+  - email
+email:
+  - "22521603@gm.uit.edu.vn"
+alert_text: |
+  Network Scan Alert: {0}
+  Time: {1}
+  Source IP: {2}
+  Details: {3}
+  Action: Please check if {2} is an authorized device. Block it if suspicious.
+alert_text_type: alert_text_only
+alert_text_args:
+  - "zeek.notice.note"
+  - "@timestamp"
+  - "source.ip"
+  - "zeek.notice.msg"

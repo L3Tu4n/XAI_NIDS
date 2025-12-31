@@ -1,0 +1,22 @@
+name: FTP Brute Force Detected
+type: any
+index: filebeat-*
+filter:
+  - term:
+      zeek.notice.note.keyword: "FTP::Bruteforcer"
+alert:
+  - email
+email:
+  - "22521603@gm.uit.edu.vn"
+alert_text: |
+  FTP Brute Force Alert: {0}
+  Time: {1}
+  Source IP: {2}
+  Details: {3}
+  Action: Verify IP {2} for FTP authorization. Block if unauthorized or showing multiple failed logins to prevent further attacks.
+alert_text_type: alert_text_only
+alert_text_args:
+  - "zeek.notice.note"
+  - "@timestamp"
+  - "source.ip"
+  - "zeek.notice.msg"

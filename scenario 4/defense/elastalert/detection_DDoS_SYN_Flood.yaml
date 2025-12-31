@@ -1,0 +1,78 @@
+name: DDoS SYN Flood
+type: any
+index: filebeat-*
+filter:
+  - wildcard:
+      message.keyword:
+        value: "*[DDoS] SYN Flood*"
+realert:
+  minutes: 5
+query_delay:
+  minutes: 1
+alert:
+  - email  
+  - command
+email:
+  - "22521546@gm.uit.edu.vn"
+alert_text_type: alert_text_only
+alert_text: |
+  🚨 DDoS SYN Flood detected!
+  Log: {0}
+alert_text_args: 
+  - "message"
+
+command:
+  - /bin/bash
+  - -c
+  - |
+    #!/usr/bin/env bash
+    
+    # Lấy dữ liệu trực tiếp từ ElastAlert template
+    msg='%(message)s'
+    echo "Debug - Full message: '$msg'" >&2
+    
+    # Regex phù hợp với format: (TCP) 228.43.4.3:45022 -> 192.168.63.130:21
+    if [[ $msg =~ \{([A-Z]+)\}[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+)[[:space:]]*-\>[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+) ]]; then
+      protocol=${BASH_REMATCH[1]}
+      source_ip=${BASH_REMATCH[2]}
+      source_port=${BASH_REMATCH[3]}
+      dest_ip=${BASH_REMATCH[4]}
+      dest_port=${BASH_REMATCH[5]}
+      
+      echo "Parsed - Protocol: $protocol, Source: $source_ip:$source_port, Dest: $dest_ip:$dest_port" >&2
+      
+      ansible-playbook /home/elkstack/DACN/ansible/DDoS_SYN_Flood.yml \
+        -i "$dest_ip," \
+        --private-key=/home/elkstack/.ssh/id_rsa_elastalert2 \
+        -e ansible_user=nodea \
+        -e protocol="$protocol" \
+        -e source_ip="$source_ip" \
+        -e dest_port="$dest_port" \
+        -e target="$dest_ip"
+    else
+      echo "Failed to parse message: '$msg'" >&2
+      echo "Trying simple IP extraction..." >&2
+      
+      # Fallback: chỉ lấy IP đơn giản
+      if [[ $msg =~ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+)[[:space:]]*-\>[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+) ]]; then
+        source_ip=${BASH_REMATCH[1]}
+        source_port=${BASH_REMATCH[2]}
+        dest_ip=${BASH_REMATCH[3]}
+        dest_port=${BASH_REMATCH[4]}
+        protocol="TCP"
+        
+        echo "Simple parsing successful - Source: $source_ip:$source_port, Dest: $dest_ip:$dest_port" >&2
+        
+        ansible-playbook /home/elkstack/DACN/ansible/DDoS_SYN_Flood.yml \
+          -i "$dest_ip," \
+          --private-key=/home/elkstack/.ssh/id_rsa_elastalert2 \
+          -e ansible_user=nodea \
+          -e protocol="$protocol" \
+          -e source_ip="$source_ip" \
+          -e dest_port="$dest_port" \
+          -e target="$dest_ip"
+      else
+        echo "All parsing failed! Raw message: '$msg'" >&2
+        exit 1
+      fi
+    fi

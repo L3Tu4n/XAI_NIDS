@@ -1,0 +1,31 @@
+name: Detect and Delete Ransomware File
+type: any
+index: filebeat-*
+filter:
+  - term:
+      zeek.notice.note.keyword: "Ransomware::KnownBadFilename"
+alert:
+  - command
+  - email
+command:
+  - /bin/bash
+  - -lc
+  - |
+    ansible-playbook /home/l3tu4n/DACN/ansible/delete_malicious.yaml \
+      -i '%(destination.ip)s,' \
+      --private-key=/home/l3tu4n/.ssh/id_rsa_elastalert2 \
+      -e "file_name=$(echo '%(zeek.notice.msg)s' | grep -oP 'Known bad file name: \K[^ ]+') target=%(destination.ip)s" \
+email:
+  - "22521603@gm.uit.edu.vn"
+alert_text: |
+  Ransomware File Alert: {0}
+  Time: {1}
+  Destination IP: {2}
+  Details: {3}
+  Action: A malicious file on {2} has been automatically deleted via Ansible playbook. Please verify if this is a legitimate threat.
+alert_text_type: alert_text_only
+alert_text_args:
+  - "zeek.notice.note"
+  - "@timestamp"
+  - "destination.ip"
+  - "zeek.notice.msg"
