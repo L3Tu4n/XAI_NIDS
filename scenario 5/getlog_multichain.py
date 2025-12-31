@@ -61,26 +61,28 @@ def load_state():
         with open(STATE_FILE, "r") as f: return json.load(f)
     except: return None
 
-# --- [HÀM ĐÃ SỬA] Thay đổi ưu tiên hiển thị ---
+# --- Thay đổi ưu tiên hiển thị ---
 def send_log(data, stream):
     data["stream"] = stream
-    try:
-        requests.post(LOGSTASH_URL, json=data, timeout=5).raise_for_status()
-        
-        # Xử lý thời gian
-        raw_ts = data.get('ts', data.get('timestamp', ''))
-        dt = parse_timestamp(str(raw_ts))
-        display_ts = dt.strftime("%Y-%m-%d %H:%M:%S") if dt else raw_ts
-        
-        if 'note' in data:
-            content = data.get('note')
-        else:
-            content = data.get('msg') or data.get('classification') or "Alert"
-        
-        print(f"[+] [{stream}] [{display_ts}] {content} -> Đã gửi tới ELK")
-        return True
-    except:
-        return False
+    max_retries = 3    
+    for attempt in range(1, max_retries + 1):
+        try:
+            requests.post(LOGSTASH_URL, json=data, timeout=5).raise_for_status()
+            
+            raw_ts = data.get('ts', data.get('timestamp', ''))
+            dt = parse_timestamp(str(raw_ts))
+            display_ts = dt.strftime("%Y-%m-%d %H:%M:%S") if dt else raw_ts
+            
+            content = data.get('note') if 'note' in data else (data.get('msg') or data.get('classification') or "Alert")
+            print(f"[+] [{stream}] [{display_ts}] {content} -> Đã gửi tới ELK")
+            return True
+            
+        except Exception as e:
+            print(f"[!] Thử lại lần {attempt}/{max_retries} cho stream {stream} do lỗi: {e}")
+            if attempt < max_retries:
+                time.sleep(1)
+                
+    return False
 
 def save_fail(data, stream):
     with open(FAILED_LOG, "a") as f:
