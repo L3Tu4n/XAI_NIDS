@@ -7,6 +7,19 @@ __pycache__/
 venv/
 nids_env/
 
+# Virtualenv
+env_nids/
+
+# Datasets
+CIC-IDS-2017/
+
+# Trained models & results
+models/
+evaluation_results/
+
+# Python cache
+__pycache__/
+*.pyc
 
 # Logs
 logs/

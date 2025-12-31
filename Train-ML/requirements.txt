@@ -1,0 +1,14 @@
+scikit-learn==1.6.1
+pandas>=2.0.0,<2.4
+numpy>=1.24.0,<2.4
+joblib>=1.3.0,<2.0
+lightgbm>=4.0.0
+shap>=0.42.0
+lime>=0.2.0.1
+matplotlib>=3.8.0,<3.10
+seaborn>=0.13.0   # (tùy chọn, nhưng hữu ích cho visualization)
+werkzeug==3.0.1
+mlflow
+imbalanced-learn
+pyarrow 
+fastparquet
