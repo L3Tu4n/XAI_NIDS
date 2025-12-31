@@ -112,23 +112,12 @@ services:
     volumes:
       - ./models:/opt/ml-nids/models:ro
     environment:
-<<<<<<< HEAD
       - ENCODER_PATH=/opt/ml-nids/models/feature_schema_lgbm.pkl
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     
       - INPUT_TOPIC=zeek-raw
       - OUTPUT_TOPIC=ml-predictions
       - XAI_QUEUE_TOPIC=xai-queue
-=======
-      # Kafka configuration
-      - ENCODER_PATH=/opt/ml-nids/models/feature_schema_lgbm.pkl
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      
-      # Topic names - CORRECTED
-      - INPUT_TOPIC=zeek-raw             # Input từ Filebeat (tên topic chuẩn)
-      - OUTPUT_TOPIC=ml-predictions   
-      - XAI_QUEUE_TOPIC=xai-queue     # Output sau aggregate + ML
->>>>>>> 0256bb75b84656b7b323e070c4d129eb9a6d1f6b
       - CONSUMER_GROUP=stream-aggregator-group
       
       # Window configuration
@@ -209,10 +198,6 @@ services:
       
       - ES_INDEX=ml-nids-alerts
       - LLM_PROVIDER=gemini
-<<<<<<< HEAD
-=======
-      - GEMINI_API_KEY=AIzaSyCPPoZwFiIks2zao0w6sIe5l-JwZTwOdA0
->>>>>>> 0256bb75b84656b7b323e070c4d129eb9a6d1f6b
       - XAI_DEDUP_HOURS=1
       - LOG_LEVEL=INFO
     restart: unless-stopped
