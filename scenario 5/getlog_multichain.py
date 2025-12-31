@@ -133,11 +133,11 @@ def save_fail(data, stream):
 if __name__ == "__main__":
     config = load_state()
 
-try:
-    validate_state_config(config)
-except ValueError as e:
-    print(e)
-    exit(1)
+    try:
+        validate_state_config(config)
+    except ValueError as e:
+        print(e)
+        exit(1)
 
     mode = "FILTER" if config else "PULL_ALL"
     
