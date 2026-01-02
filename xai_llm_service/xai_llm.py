@@ -124,7 +124,6 @@ class LLMExplainer:
                 "is_anomaly": alert_data.get('is_anomaly')
             },
             "network_telemetry": {
-                # Truyền mọi thông số có trong log của bạn
                 "protocol_info": {
                     "proto": alert_data.get('proto'),
                     "service": alert_data.get('service'),
@@ -150,6 +149,7 @@ class LLMExplainer:
                     },
                     "outliers": {
                         "dns_entropy": alert_data.get('dns_entropy'),
+                        "dns_query_len": alert_data.get('dns_query_len'),
                         "duration": alert_data.get('duration')
                     }
                 }

@@ -31,13 +31,17 @@ system_instruction: |
      - If conn_state == SF:
        → successful session establishment
        → use 'flow:established,to_server;'
-
+       If behavior is reconnaissance or general scanning (catches both successful and failed attempts): Select new_connection as a comprehensive catch-all.
+       If behavior is connection-oriented but focuses on failures (Scan, DoS, Brute-force with many REJs): Select connection_attempt to catch SYNs.
+       If behavior is session-oriented (Exfiltration, Established Brute-force): Select connection_established.
+       If behavior is protocol-specific (DNS, HTTP): Select the relevant protocol event (e.g., dns_request).
   2. VELOCITY (Rate-based analysis):
      - High-velocity attacks (e.g. DoS, Brute-force, aggressive scanning):
        * Zeek `$epoch` = 60sec
-       * strict Suricata thresholds
+       * Suricata: Use strict threshold or detection_filter (short seconds, high count).
      - Low-velocity / stealthy attacks (e.g. slow scan, low-and-slow brute-force):
        * Zeek `$epoch` = 300sec
+       * Suricata: Use broad threshold or detection_filter (long seconds, lower count).
 
   3. PROTOCOL ANOMALIES:
      - High dns_entropy or long dns_query_len:
@@ -57,7 +61,7 @@ system_instruction: |
   2. suricata_rule:
      - Structure:
        alert [proto] $EXTERNAL_NET any -> $HOME_NET [port] (
-         msg:'[DESCRIPTION]';
+         msg:"[DESCRIPTION]";
          [flow];
          [threshold or detection];
          sid:[SID];
@@ -67,64 +71,60 @@ system_instruction: |
      - SID REQUIREMENT: Use a unique `sid` starting from 5000000 (e.g., 5000001, 5000002).
 
   3. zeek_script:
-     - MUST use official Zeek SumStats framework
+     - MUST follow this EXACT logical structure:
 
-     - REQUIRED components:
-       * @load base/frameworks/sumstats
-       * event zeek_init()
-       * SumStats::Reducer
-       * SumStats::create
-       * SumStats::observe
+       A. Boilerplate:
+          @load base/frameworks/sumstats
+          @load base/frameworks/notice
 
-     - REDUCER RULES:
-       * Reducer MUST be declared ONLY as:
-         local r = SumStats::Reducer(
-           $stream = "<string>",
-           $apply  = set(SumStats::SUM or SumStats::UNIQUE)
-         );
+       B. Module & Enum Definition:
+          module <ModuleName>;
+          export { redef enum Notice::Type += { <ActionName> }; }
 
-     - CREATE RULES:
-       * SumStats::create MUST be called ONLY using a record literal:
-         SumStats::create([
-           $name = "<string>",
-           $epoch = <interval>,
-           $reducers = set(r),
-           $threshold = <number>,
-           $threshold_crossed = function(ts: time, key: SumStats::Key, result: SumStats::Result)
-           {
-             <alert logic>
-           }
-         ]);
+       C. Initialization & SumStats Creation:
+          event zeek_init() {
+            local r = SumStats::Reducer($stream="<id>", $apply=set(SumStats::SUM));
+            SumStats::create([
+              $name = "<id>",
+              $epoch = <Calculated_Epoch>,
+              $reducers = set(r),
+              $epoch_result(ts: time, key: SumStats::Key, result: SumStats::Result) = {
+                local val = result["<id>"]$sum;
+                if ( val >= <Calculated_Threshold>.0 ) {
+                  NOTICE([
+                    $note = <ModuleName>::<ActionName>,
+                    $msg = fmt("<behavior_desc>", key$host, val),
+                    $src = key$host,
+                    $identifier = cat(key$host),
+                    $suppress_for = 1hr
+                  ]);
+                }
+              }
+            ]);
+          }
 
-     - OBSERVE RULES:
-       * SumStats::observe MUST be called ONLY as:
-         SumStats::observe(
-           "<stream>",
-           [$host = c$id$orig_h],
-           [$num = 1]
-         );
-
-     - TRACKING RULE:
-       * Attacker MUST be tracked using:
-         [$host = c$id$orig_h]
-
+       D. Observation Trigger:
+          event <relevant_event>(c: connection) {
+            SumStats::observe("<id>", [$host = c$id$orig_h], [$num = 1]);
+          }
+          MUST use the most appropriate event based on the analysis:
+          - `connection_attempt(c: connection)`: For probing/failed connection attempts.
+          - `connection_established(c: connection)`: For behaviors requiring a successful handshake (e.g., Exfiltration).
+          - `new_connection(c: connection)`: For catching all initial connections (Best for general Scanning).
+          - `dns_request(c: connection, msg: dns_msg, query: string, qtype: count, qclass: count)`: For DNS anomalies.
+          
+          Inside the event: SumStats::observe("<id>", [$host = c$id$orig_h], [$num = 1]);
      - FORBIDDEN:
-       * `$threshold_handled`
-       * custom or helper functions (e.g. make_reducer)
-       * global event handlers for thresholds
-       * lambda / arrow functions
-       * invented SumStats fields or APIs
-       * hardcoded IPs or ports
-       * conditional logic tied to specific values
-         (e.g. `if (c$id$orig_h == ...)`)
-       * ANY deviation from the allowed patterns above
+       * NEVER use '$threshold' or '$threshold_crossed' in the record literal.
+       * NEVER use integer numbers; always use double format (e.g., 10.0).
+       * No helper/custom functions.
 
   ### CRITICAL CONSTRAINTS
-  - Return ONLY a valid JSON object
+  - Return ONLY a valid JSON object.
+  - Ensure the 'note' column is in 'Module::Action' format.
+  - Zeek log 'note' column MUST follow 'Module::Action' format.
+  - Time Intervals: Must ALWAYS use units like sec, min (e.g., 60sec)
   - Never hardcode a specific port for multi-port behavior
-  - Use single quotes `'` inside Suricata rule strings
-  - If a Zeek script cannot be produced following the exact rules above,
-    return an empty string for `"zeek_script"`
 
   ### JSON SCHEMA
   {
