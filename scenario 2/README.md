@@ -1,13 +1,17 @@
-Mô tả: Tấn công DDoS SYN Flood bằng hping3
+**Mô tả:** Kiểm tra toàn bộ dải mạng nội bộ để xác định những địa chỉ IP nào đang hoạt động.
 
-Câu lệnh thực thi:
+**Câu lệnh thực thi:**
+```bash
+nmap -sn 192.168.63.0/24
+```
+- `-sn`: Chế độ **Ping Scan**. Nmap sẽ gửi các gói tin thăm dò (như ICMP Echo Request) để xác định vật chủ đang hoạt động nhưng bỏ qua bước quét cổng nhằm tăng tốc độ và tránh bị phát hiện.
+- `<network-range>`: Dải địa chỉ IP của mạng mục tiêu cần rà soát.
 
-hping3 -c 1000 -d 120 -S -w 64 -p 21 --flood --rand-source <ip-target>
--c 1000: Gửi 1000 gói tin.
--d 120: Kích thước dữ liệu mỗi gói là 120 byte.
--S: Đặt cờ SYN trong gói tin TCP (mô phỏng kết nối TCP chưa hoàn chỉnh).
--w 64: Đặt kích thước cửa sổ TCP là 64.
--p 21: Nhắm đến cổng 21 (dịch vụ FTP).
---flood: Gửi gói tin nhanh nhất có thể.
---rand-source: Sử dụng địa chỉ IP nguồn ngẫu nhiên (spoofing).
-<ip-target>: Địa chỉ IP đích của mục tiêu.
+**Mô tả**: Sau khi xác định được máy mục tiêu đang hoạt động, thực hiện rà soát chuyên sâu để liệt kê các cổng dịch vụ đang mở và thông tin phiên bản phần mềm nhằm xác định bề mặt tấn công của hệ thống.
+
+**Câu lệnh thực thi:**
+```bash
+nmap -sV 192.168.63.130
+```
+- `-sB`: **Version Detection**. Nmap sẽ gửi các gói tin thăm dò đến các cổng mở để phân tích phản hồi, từ đó xác định dịch vụ đang mở và phiên bản phần mềm.
+- `<ip-target>`: Địa chỉ IP của mục tiêu.
