@@ -1,2 +1,0 @@
-#DNS Tunneling
-alert udp any any -> $HOME_NET 53 (msg:"[DNS Tunneling] Suspicious Hex Subdomain"; pcre:"/[0-9a-fA-F]{30,}/"; threshold:type limit, track by_src, count 1, seconds 30; sid:4;)

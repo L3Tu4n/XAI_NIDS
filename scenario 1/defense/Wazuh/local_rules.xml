@@ -1,0 +1,60 @@
+<group name="zeek,custom_detection">
+  <rule id="220001" level="15">
+    <field name="note">^FTP::Bruteforcer$</field>
+    <description>Zeek: FTP Brute force detected from $(src)</description>
+    <group>attack,bruteforce</group>
+  </rule>
+
+  <rule id="220002" level="16">
+    <field name="note">^Ransomware::KnownBadFilename$</field>
+    <field name="msg" type="pcre2">Known bad file name: (.*?) in command</field>
+    <description>Zeek: Ransomware detected - Known bad filename $(1)</description>
+    <group>attack,ransomware</group>
+  </rule>
+
+  <rule id="220003" level="10">
+    <field name="note">^Scan::Address_Scan$|^Scan::Port_Scan$|^Scan::Random_Scan$</field>
+    <description>Zeek: Network scanning activity detected from $(src)</description>
+    <group>reconnaissance,attack</group>
+  </rule>
+</group>
+
+
+<group name="suricata,custom_detection">
+  <rule id="230001" level="12">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature_id">^1000004$</field>
+    <description>Suricata: FTP Brute Force Detected from $(src_ip)</description>
+    <group>authentication_failure,bruteforce</group>
+  </rule>
+
+  <rule id="230002" level="10">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature_id">^1000005$</field>
+    <description>Suricata: TCP SYN Scan Detected from $(src_ip)</description>
+    <group>reconnaissance</group>
+  </rule>
+</group>
+
+<group name="unified_response,correlation">
+  <rule id="250001" level="15">
+    <if_sid>220001, 230001</if_sid>
+    <description>Unified Defense: FTP Brute Force detected</description>
+    <group>authentication_failure,bruteforce,unified_alert</group>
+  </rule>
+
+  <rule id="250002" level="12">
+    <if_sid>220003, 230002</if_sid>
+    <description>Unified Defense: Network Scanning behavior detected</description>
+    <group>reconnaissance,unified_alert</group>
+  </rule>
+</group>
+
+
+<group name="local,active_response,">
+  <rule id="300001" level="3">
+    <if_sid>607</if_sid>
+    <match>simple-block.sh</match>
+    <description>Active Response: custom script simple-block.sh: executed</description>
+  </rule>
+</group>

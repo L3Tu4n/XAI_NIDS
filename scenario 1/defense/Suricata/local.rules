@@ -1,0 +1,5 @@
+#Brute Force FTP
+alert tcp $HOME_NET 21 -> any any (msg:"ALERT: [BRUTE FORCE] FTP Failed Logins Detected"; flow:established,from_server; content:"530"; threshold:type both, track by_dst, count 5, seconds 60; classtype:attempted-admin; sid:1000004; rev:1;)
+
+#Scan Attack
+alert tcp any any -> $HOME_NET any (msg:"ALERT: [SCAN] TCP SYN Scan Detected"; flags:S; flow:stateless; threshold:type threshold, track by_src, count 10, seconds 10; classtype:attempted-recon; sid:1000005; rev:1;)
