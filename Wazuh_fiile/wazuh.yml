@@ -1,0 +1,4 @@
+- module: wazuh
+  alerts:
+    enabled: true
+    var.paths: ["/var/ossec/logs/alerts/alerts.json"]
