@@ -55,38 +55,59 @@ class SHAPExplainer:
 
     def explain(self, features_dict, top_n=10):
         try:
-            ordered_vals = []
-            for name in self.feature_names:
-                val = features_dict.get(name, 0)
-                ordered_vals.append(float(val) if val is not None else 0.0)
-
+            # 1. Chuẩn bị dữ liệu (giữ nguyên logic của bạn)
+            ordered_vals = [float(features_dict.get(name, 0) or 0.0) for name in self.feature_names]
             df = pd.DataFrame([ordered_vals], columns=self.feature_names)
             
             for col in self.cat_cols:
                 if col in df.columns:
                     df[col] = df[col].fillna(0).astype(int).astype('category')
 
+            # 2. Lấy dự đoán của Ensemble để tìm Class thắng cuộc
+            # Trung bình xác suất từ 3 models
+            avg_probs = np.mean([model.predict_proba(df) for model in self.models], axis=0)
+            pred_class_idx = np.argmax(avg_probs) # Class có xác suất cao nhất
+            confidence = float(avg_probs[0][pred_class_idx])
+
+            # 3. Tính SHAP values cho DUY NHẤT class đó
             shap_list = []
-            for explainer in self.explainers:
-                sv = explainer.shap_values(df)
-                if isinstance(sv, list): sv = np.mean(sv, axis=0)
+            for i, explainer in enumerate(self.explainers):
+                sv_multiclass = explainer.shap_values(df)
+                
+                # Xử lý trường hợp multiclass (trả về list)
+                if isinstance(sv_multiclass, list):
+                    sv = sv_multiclass[pred_class_idx]
+                else:
+                    sv = sv_multiclass # Trường hợp binary
+                    
                 if sv.ndim == 2: sv = sv[0]
-                elif sv.ndim > 2: sv = sv.reshape(-1, len(self.feature_names))[0]
                 shap_list.append(sv)
 
-            avg_shap = np.mean(np.array(shap_list), axis=0)
+            # 4. Trung bình điểm SHAP từ 3 models cho class đã chọn
+            avg_shap = np.mean(shap_list, axis=0)
+
+            # 5. Đóng gói kết quả
             feat_imp = []
             for i, name in enumerate(self.feature_names):
                 val = float(avg_shap[i])
                 feat_imp.append({
-                    'feature': name, 'shap_value': val, 'abs_shap_value': abs(val),
+                    'feature': name,
+                    'shap_value': val,
+                    'abs_shap_value': abs(val),
                     'feature_value': float(ordered_vals[i]),
                     'direction': 'attack' if val > 0 else 'benign'
                 })
+                
             feat_imp.sort(key=lambda x: x['abs_shap_value'], reverse=True)
-            return {'top_features': feat_imp[:top_n], 'prediction_score': float(avg_shap.sum())}
+            
+            return {
+                'top_features': feat_imp[:top_n],
+                'prediction_score': confidence, # Dùng xác suất thực tế
+                'target_class_idx': int(pred_class_idx)
+            }
         except Exception as e:
-            logger.error(f"SHAP Error: {e}"); return None
+            logger.error(f"SHAP Error: {e}")
+            return None
 
 # ==========================================
 # 3. LLM EXPLAINER
