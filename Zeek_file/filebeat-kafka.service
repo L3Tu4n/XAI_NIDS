@@ -1,17 +1,19 @@
 [Unit]
-Description=Filebeat Kafka for Zeek Logs
-After=network.target
+Description=Filebeat Kafka Instance
+Documentation=https://www.elastic.co/beats/filebeat
+Wants=network-online.target
+After=network-online.target
 
 [Service]
-Type=simple
-ExecStart=/usr/share/filebeat/filebeat \
-  -c /etc/filebeat-kafka/filebeat.yml \
-  -path.home /usr/share/filebeat \
-  -path.config /etc/filebeat-kafka \
-  -path.data /var/lib/filebeat-kafka \
-  -path.logs /var/log/filebeat-kafka
+UMask=0027
+Environment="GODEBUG='madvdontneed=1'"
+Environment="BEAT_LOG_OPTS="
+# Trỏ đúng vào file config riêng của bạn
+Environment="BEAT_CONFIG_OPTS=-c /etc/filebeat-kafka/filebeat.yml"
+# TÁCH BIỆT hoàn toàn path.data và path.logs
+Environment="BEAT_PATH_OPTS=--path.home /usr/share/filebeat --path.config /etc/filebeat-kafka --path.data /var/lib/filebeat-kafka --path.logs /var/l>
+ExecStart=/usr/share/filebeat/bin/filebeat --environment systemd $BEAT_LOG_OPTS $BEAT_CONFIG_OPTS $BEAT_PATH_OPTS
 Restart=always
-User=root
 
 [Install]
 WantedBy=multi-user.target
